@@ -1,0 +1,188 @@
+# ---------------------------------------------------------------------------
+# Mini Checkout - Fase 0
+#
+# Cada fronteira do sistema é um processo separado de propósito:
+#   - nginx + app  -> concorrência real (artisan serve atende 1 requisição por vez)
+#   - worker       -> dá para matar no meio de um job, e é o 2º processo que o
+#                     trace_id precisa atravessar na Fase 4
+#   - gateway      -> HTTP de saída de verdade: timeout e 500 só existem com rede
+#   - db / redis   -> estado durável e locks, deriváveis no caos da Fase 6
+# ---------------------------------------------------------------------------
+name: minicheckout
+
+x-app-env: &app-env
+  # Topologia: definida aqui, sempre ganha de src/.env.
+  DB_CONNECTION: pgsql
+  DB_HOST: db
+  DB_PORT: 5432
+  DB_DATABASE: ${DB_DATABASE:-minicheckout}
+  DB_USERNAME: ${DB_USERNAME:-minicheckout}
+  DB_PASSWORD: ${DB_PASSWORD:-secret}
+  REDIS_HOST: redis
+  REDIS_PORT: 6379
+  REDIS_CLIENT: phpredis
+  QUEUE_CONNECTION: redis
+  CACHE_STORE: redis
+  SESSION_DRIVER: redis
+  # stderr => os logs saem no `docker compose logs`, não num arquivo dentro do container.
+  # Fase 1 troca o formatter deste canal para JSON.
+  LOG_CHANNEL: stderr
+  LOG_LEVEL: debug
+  GATEWAY_URL: http://gateway:8080
+
+x-app: &app
+  build:
+    context: .
+    dockerfile: docker/app/Dockerfile
+  image: minicheckout-app:dev
+  volumes:
+    - ./src:/var/www/html
+  depends_on:
+    db:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+
+services:
+  # --- entrada HTTP ---------------------------------------------------------
+  nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    ports:
+      - "${APP_PORT:-8010}:80"
+    volumes:
+      - ./src:/var/www/html:ro
+      - ./docker/nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      app:
+        condition: service_healthy
+    healthcheck:
+      # /up é a rota de health que o Laravel já traz. Passar aqui significa
+      # nginx -> php-fpm -> Laravel -> banco inteiros de pé.
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/up >/dev/null || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 60s
+
+  # --- Laravel (php-fpm) ----------------------------------------------------
+  app:
+    <<: *app
+    restart: unless-stopped
+    environment:
+      <<: *app-env
+      # Só este container roda migrate, para o worker não disputar a tabela.
+      RUN_MIGRATIONS: "true"
+    healthcheck:
+      test: ["CMD-SHELL", "php -r '$$s=@fsockopen(\"127.0.0.1\", 9000); exit($$s ? 0 : 1);'"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 120s
+
+  # --- worker de fila -------------------------------------------------------
+  worker:
+    <<: *app
+    restart: unless-stopped
+    environment: *app-env
+    # Fase 2 vai mexer em tries/backoff; aqui ainda é o default cru, de propósito.
+    command: ["php", "artisan", "queue:work", "--verbose", "--tries=1"]
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      app:
+        # garante que as migrations já rodaram
+        condition: service_healthy
+
+  # --- banco ----------------------------------------------------------------
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_DATABASE:-minicheckout}
+      POSTGRES_USER: ${DB_USERNAME:-minicheckout}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-secret}
+    ports:
+      - "${DB_PORT_HOST:-55432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USERNAME:-minicheckout} -d ${DB_DATABASE:-minicheckout}"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  # --- redis: fila, cache e locks ------------------------------------------
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # Sem persistência: na Fase 6, derrubar o Redis precisa doer de verdade
+    # (jobs na fila somem). Se quiser durabilidade depois, ligue o appendonly.
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "${REDIS_PORT_HOST:-56379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  # --- gateway de pagamento fake -------------------------------------------
+  gateway:
+    build:
+      context: .
+      dockerfile: docker/gateway/Dockerfile
+    image: minicheckout-gateway:dev
+    restart: unless-stopped
+    ports:
+      - "${GATEWAY_PORT:-8011}:8080"
+    volumes:
+      # bind mount: editar o gateway não exige rebuild
+      - ./gateway:/app
+    environment:
+      GATEWAY_LATENCY_MS: ${GATEWAY_LATENCY_MS:-0}
+      GATEWAY_FAIL_RATE: ${GATEWAY_FAIL_RATE:-0}
+      GATEWAY_DECLINE_RATE: ${GATEWAY_DECLINE_RATE:-0}
+      GATEWAY_TIMEOUT_RATE: ${GATEWAY_TIMEOUT_RATE:-0}
+      GATEWAY_TIMEOUT_SLEEP_MS: ${GATEWAY_TIMEOUT_SLEEP_MS:-30000}
+      GATEWAY_DUPLICATE_WEBHOOK: ${GATEWAY_DUPLICATE_WEBHOOK:-0}
+      GATEWAY_WEBHOOK_DELAY_MS: ${GATEWAY_WEBHOOK_DELAY_MS:-400}
+      GATEWAY_WEBHOOK_URL: ${GATEWAY_WEBHOOK_URL:-http://nginx/webhooks/payments}
+    healthcheck:
+      test: ["CMD-SHELL", "php -r '$$s=@fsockopen(\"127.0.0.1\", 8080); exit($$s ? 0 : 1);'"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # --- observabilidade: Grafana + Loki + Tempo + Prometheus + Collector ----
+  lgtm:
+    image: grafana/otel-lgtm:latest
+    restart: unless-stopped
+    ports:
+      - "${GRAFANA_PORT:-3010}:3000"   # Grafana
+      - "${OTLP_GRPC_PORT:-4317}:4317" # OTLP gRPC
+      - "${OTLP_HTTP_PORT:-4318}:4318" # OTLP HTTP
+    volumes:
+      - lgtm-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:3000/api/health >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+
+  # --- carga e concorrência (não sobe no `up` normal) ----------------------
+  k6:
+    image: grafana/k6:latest
+    profiles: ["tools"]
+    volumes:
+      - ./k6:/scripts:ro
+    environment:
+      BASE_URL: http://nginx
+      GATEWAY_URL: http://gateway:8080
+
+volumes:
+  pgdata:
+  lgtm-data:
