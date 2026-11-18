@@ -3,10 +3,47 @@
 Observabilidade, rastreabilidade, tratamento de erros e idempotência num domínio
 minúsculo. O roteiro das fases está no [CLAUDE.md](CLAUDE.md).
 
-Cada fase tem um commit e um documento em [`docs/`](docs/), com o que foi feito,
-como replicar do zero e as armadilhas do caminho:
+## Documentação
+
+Tudo neste projeto é documentado. Em três lugares, com papéis diferentes:
+
+| Onde | O quê |
+|---|---|
+| [`docs/fase-*.md`](docs/) | Uma por fase: o que foi feito, como replicar do zero, as armadilhas |
+| [`docs/api/*.yaml`](docs/api/) | O contrato das APIs em OpenAPI 3.1, escrito à mão |
+| Os próprios arquivos de código | O porquê de cada decisão, e o `TODO` de cada conceito ainda não implementado |
+
+Documentos de fase:
 
 - [Fase 0 — Setup](docs/fase-0-setup.md)
+
+### As APIs (Swagger)
+
+```bash
+docker compose up -d swagger
+```
+
+Abre em **http://localhost:8012**, com duas specs no seletor do topo:
+
+| Spec | O que documenta |
+|---|---|
+| Mini Checkout API | `POST /orders`, `GET /orders/{id}`, `POST /webhooks/payments` |
+| Fake Payment Gateway | `POST /charge`, os headers `X-Chaos-*` e o webhook que ele emite |
+
+As specs são **escritas à mão** e são a fonte da verdade: nada é gerado a
+partir do código. O motivo é que o que mais precisa de documentação aqui não é
+inferível — que o `Idempotency-Key` é obrigatório, o que `409` vai significar,
+por que o mesmo payload devolve a resposta salva, e que o webhook pode chegar
+duplicado e fora de ordem. Escrever isso à mão obriga a decidir a semântica
+antes de implementar.
+
+O custo dessa escolha é o drift: a spec pode mentir se você mudar o código e
+não mexer nela. A regra que compensa isso é **mudança de contrato e mudança de
+spec no mesmo commit da fase**. Onde o contrato ainda vai mudar, a spec já diz
+qual fase vai mudá-lo.
+
+O botão **Try it out** funciona de verdade: `config/cors.php` libera a origem
+do Swagger UI para as rotas do projeto e expõe o `X-Request-Id` no response.
 
 ## Onde o Docker está
 
@@ -45,6 +82,7 @@ passam — se ele falhar, o healthcheck te diz qual serviço não ficou de pé.
 |---|---|
 | App (nginx) | http://localhost:8010 |
 | Gateway fake | http://localhost:8011 |
+| **Swagger UI** | **http://localhost:8012** |
 | Grafana | http://localhost:3010 |
 | OTLP (gRPC / HTTP) | 4317 / 4318 |
 | Postgres | localhost:55432 |

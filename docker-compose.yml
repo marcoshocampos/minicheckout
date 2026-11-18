@@ -173,6 +173,32 @@ services:
       retries: 30
       start_period: 60s
 
+  # --- documentação da API --------------------------------------------------
+  # As specs em docs/api/ são escritas à mão e são a fonte da verdade do
+  # contrato. Este container só as renderiza: nada é gerado a partir do código,
+  # então mudança de contrato é mudança de arquivo, no mesmo commit da fase.
+  swagger:
+    image: swaggerapi/swagger-ui:v5.17.14
+    restart: unless-stopped
+    ports:
+      - "${SWAGGER_PORT:-8012}:8080"
+    volumes:
+      # servido estaticamente pelo nginx interno da imagem, em /spec/
+      - ./docs/api:/usr/share/nginx/html/spec:ro
+    environment:
+      URLS: >-
+        [{"url":"spec/openapi.yaml","name":"Mini Checkout API"},
+         {"url":"spec/gateway.yaml","name":"Fake Payment Gateway"}]
+      URLS_PRIMARY_NAME: Mini Checkout API
+      # mantém o "Try it out" apontando para o servidor da spec
+      SUPPORTED_SUBMIT_METHODS: '["get", "post"]'
+      DEEP_LINKING: "true"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/ >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
   # --- carga e concorrência (não sobe no `up` normal) ----------------------
   k6:
     image: grafana/k6:latest

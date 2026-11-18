@@ -1,0 +1,511 @@
+openapi: 3.1.0
+
+# =============================================================================
+# Esta spec é a FONTE DA VERDADE do contrato, escrita à mão.
+#
+# Regra do projeto: ela descreve o contrato COMO ELE É HOJE, não como vai
+# ficar. Cada fase do roteiro atualiza esta spec junto com o código, no mesmo
+# commit. Onde o contrato ainda vai mudar, está marcado com "FASE N".
+#
+# Por que à mão e não gerada: o que realmente precisa de documentação aqui não
+# é inferível do código — que o Idempotency-Key é obrigatório, o que 409
+# significa, por que o mesmo payload devolve a resposta salva, e que o webhook
+# pode chegar duplicado. Escrever isso à mão obriga a decidir a semântica.
+# =============================================================================
+
+info:
+  title: Mini Checkout API
+  version: 0.2.0
+  summary: Criação de pedidos com cobrança, notificação assíncrona e webhook.
+  description: |
+    API de um projeto de **estudo**. O domínio é propositalmente minúsculo: a
+    complexidade está nas fronteiras (HTTP de entrada, banco, HTTP de saída,
+    fila, webhook), que é onde observabilidade, rastreabilidade, tratamento de
+    erros e idempotência importam.
+
+    ### Estado atual: Fase 1 em andamento
+
+    | Fase | Assunto | Estado |
+    |---|---|---|
+    | 0 | Setup, domínio mínimo, gateway fake | concluída |
+    | 1 | Logs estruturados e correlação | em andamento |
+    | 2 | Tratamento de erros, Problem Details, retry | pendente |
+    | 3 | Idempotência (requisição, webhook e job) | pendente |
+    | 4 | Tracing distribuído | pendente |
+    | 5 | Métricas e alertas | pendente |
+
+    O que isso significa para quem lê: **as respostas de erro ainda não são
+    Problem Details** (RFC 9457) e **o `Idempotency-Key` ainda não deduplica
+    nada** — hoje ele é só obrigatório. As duas coisas estão marcadas nos
+    endpoints.
+  contact:
+    name: Repositório
+    url: https://github.com/marcoshocampos/minicheckout
+  license:
+    name: Projeto de estudo, sem licença definida
+
+servers:
+  - url: http://localhost:8010
+    description: Docker Compose local (porta do serviço nginx)
+
+tags:
+  - name: Pedidos
+    description: O fluxo único do projeto.
+  - name: Webhooks
+    description: Endpoint que o gateway de pagamento chama de volta.
+
+paths:
+  /orders:
+    post:
+      tags: [Pedidos]
+      operationId: createOrder
+      summary: Cria um pedido e tenta a cobrança
+      description: |
+        Cria o pedido com status `pending`, chama o gateway de pagamento de
+        forma **síncrona** e devolve o pedido com o resultado já aplicado.
+
+        Se a cobrança for aprovada, um job de notificação é despachado na fila
+        (Redis) e processado por outro container. O `notified_at` da resposta
+        por isso vem **quase sempre `null`**: o job ainda não rodou quando a
+        resposta é montada. Consulte `GET /orders/{id}` depois para vê-lo
+        preenchido.
+
+        #### Sobre o Idempotency-Key
+
+        O header é **obrigatório** — sem ele, `400`. Mas hoje ele não faz mais
+        nada: mandar a mesma chave duas vezes cria **dois** pedidos e gera
+        **duas** cobranças. Isso é intencional e é o ponto de partida da Fase 3.
+
+        #### O que ainda falta no contrato
+
+        - `X-Request-Id` no response: a Fase 1 vai devolvê-lo (hoje ausente)
+        - Erros em `application/problem+json`: Fase 2
+        - `409` e `422` por chave repetida, e replay da resposta salva: Fase 3
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/XRequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateOrderRequest'
+            examples:
+              aprovado:
+                summary: Pedido comum
+                value:
+                  amount_cents: 1990
+                  currency: BRL
+                  customer_email: eu@example.test
+      responses:
+        '201':
+          description: |
+            Pedido criado. Atenção: **também é 201 quando o pagamento é
+            recusado** — o pedido foi criado, o pagamento é que foi negado.
+            Olhe o campo `status`, não só o código HTTP.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+              examples:
+                pago:
+                  summary: Cobrança aprovada
+                  value:
+                    id: 01a1ef36-69f0-7128-819b-2f9d7a625b18
+                    status: paid
+                    amount_cents: 1990
+                    currency: BRL
+                    customer_email: eu@example.test
+                    payment_id: pay_ede9d00436c4ea2c
+                    decline_reason: null
+                    paid_at: '2026-11-18T15:11:24.000000Z'
+                    notified_at: null
+                    created_at: '2026-11-18T15:11:23.000000Z'
+                recusado:
+                  summary: Cobrança recusada (erro esperado)
+                  value:
+                    id: 01a1ef36-7a10-71c2-9f3e-1b8c0d4e5f60
+                    status: declined
+                    amount_cents: 1990
+                    currency: BRL
+                    customer_email: eu@example.test
+                    payment_id: pay_2b3ce738b3ac92d4
+                    decline_reason: insufficient_funds
+                    paid_at: null
+                    notified_at: null
+                    created_at: '2026-11-18T15:12:01.000000Z'
+        '400':
+          $ref: '#/components/responses/IdempotencyKeyAusente'
+        '422':
+          $ref: '#/components/responses/ErroDeValidacao'
+        '500':
+          $ref: '#/components/responses/GatewayIndisponivel'
+
+  /orders/{id}:
+    get:
+      tags: [Pedidos]
+      operationId: showOrder
+      summary: Consulta um pedido
+      description: |
+        Útil para ver o `notified_at` depois de o job da fila rodar, e para
+        acompanhar a mudança de status quando o webhook do gateway chega.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: UUID do pedido.
+          schema:
+            type: string
+            format: uuid
+        - $ref: '#/components/parameters/XRequestId'
+      responses:
+        '200':
+          description: O pedido.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+        '404':
+          description: |
+            Pedido inexistente. O corpo vem do handler padrão do Laravel e
+            **não** é Problem Details ainda (Fase 2).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    examples: ['No query results for model [App\Models\Order].']
+
+  /webhooks/payments:
+    post:
+      tags: [Webhooks]
+      operationId: receivePaymentWebhook
+      summary: Recebe a confirmação de pagamento do gateway
+      description: |
+        Chamado **pelo gateway**, não pelo cliente. O gateway envia em processo
+        separado, com atraso configurável, e pode enviar a mesma entrega mais
+        de uma vez.
+
+        #### O que hoje não é tratado, de propósito
+
+        - **Entrega duplicada.** O gateway reenvia com o **mesmo `event_id`**.
+          Hoje cada entrega é processada de novo, do começo. A Fase 3 resolve
+          com `UNIQUE(event_id)` no banco — não com um `if (já existe)`, que
+          duas entregas simultâneas furam.
+        - **Fora de ordem.** Um `payment.failed` que chegue depois de um
+          `payment.succeeded` hoje sobrescreve o status. A transição precisa
+          ser monotônica e comparar `occurred_at`, não a hora de chegada.
+        - **Autenticidade.** Não há assinatura HMAC. O gateway é nosso, mas um
+          endpoint público sem assinatura é porta aberta.
+
+        Quando o pedido não existe, responde `202` e **descarta** o evento —
+        uma decisão que a Fase 3 deve revisar: devolver erro faria o gateway
+        reentregar, o que é a favor de quem processa, desde que o
+        processamento seja idempotente.
+      parameters:
+        - name: X-Gateway-Event-Id
+          in: header
+          description: Mesmo valor de `event_id` do corpo, para facilitar o log.
+          schema:
+            type: string
+        - name: X-Gateway-Delivery
+          in: header
+          description: |
+            Contador da entrega, no formato `n/total`. É assim que você **vê**
+            a duplicata no log em vez de adivinhar.
+          schema:
+            type: string
+            examples: ['2/3']
+        - $ref: '#/components/parameters/XRequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PaymentEvent'
+      responses:
+        '200':
+          description: Evento processado.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    const: ok
+        '202':
+          description: Pedido não encontrado; o evento foi descartado.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    const: ignored
+        '422':
+          $ref: '#/components/responses/ErroDeValidacao'
+
+  /up:
+    get:
+      tags: [Pedidos]
+      operationId: healthCheck
+      summary: Health check
+      description: |
+        Rota nativa do Laravel. É o que o healthcheck do container `nginx` no
+        Docker Compose consulta: passar aqui significa nginx, php-fpm, Laravel
+        e banco inteiros de pé.
+      responses:
+        '200':
+          description: Aplicação saudável.
+          content:
+            text/html:
+              schema:
+                type: string
+
+components:
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: |
+        Chave escolhida pelo cliente para identificar **a intenção** da
+        requisição. Serve para você poder repetir a chamada com segurança
+        depois de um timeout, sem risco de cobrar duas vezes.
+
+        Hoje é só obrigatório: nada é deduplicado (Fase 3).
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 255
+        examples: ['pedido-do-cliente-42-tentativa-1']
+
+    XRequestId:
+      name: X-Request-Id
+      in: header
+      required: false
+      description: |
+        Id de correlação. Se você mandar, ele é respeitado e aparece no log de
+        acesso do nginx, nos logs da aplicação, no gateway e no job da fila. Se
+        não mandar, o nginx gera um.
+
+        É o que permite dizer "deu erro, o id é X" e alguém achar a requisição
+        inteira — inclusive o que aconteceu de forma assíncrona depois dela.
+      schema:
+        type: string
+        maxLength: 200
+
+  schemas:
+    CreateOrderRequest:
+      type: object
+      required: [amount_cents, currency, customer_email]
+      properties:
+        amount_cents:
+          type: integer
+          minimum: 1
+          maximum: 100000000
+          description: |
+            Valor em centavos. Inteiro, nunca float: dinheiro em ponto
+            flutuante é bug esperando acontecer.
+          examples: [1990]
+        currency:
+          type: string
+          minLength: 3
+          maxLength: 3
+          enum: [BRL, USD]
+          examples: [BRL]
+        customer_email:
+          type: string
+          format: email
+          examples: [eu@example.test]
+      additionalProperties: false
+
+    Order:
+      type: object
+      required: [id, status, amount_cents, currency, customer_email, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: UUID gerado pela aplicação.
+        status:
+          $ref: '#/components/schemas/OrderStatus'
+        amount_cents:
+          type: integer
+        currency:
+          type: string
+        customer_email:
+          type: string
+          format: email
+        payment_id:
+          type: [string, 'null']
+          description: Id da cobrança no gateway. Nulo até o pagamento ser tentado.
+        decline_reason:
+          type: [string, 'null']
+          description: Só preenchido quando `status` é `declined`.
+          examples: [insufficient_funds]
+        paid_at:
+          type: [string, 'null']
+          format: date-time
+        notified_at:
+          type: [string, 'null']
+          format: date-time
+          description: |
+            Preenchido pelo job da fila, em outro processo. Quase sempre `null`
+            na resposta do `POST /orders`.
+        created_at:
+          type: string
+          format: date-time
+
+    OrderStatus:
+      type: string
+      enum: [pending, paid, declined, failed]
+      description: |
+        `declined` e `failed` são coisas diferentes, e a distinção é o assunto
+        da Fase 2:
+
+        | Status | O que aconteceu | Retentar? | Vira incidente? |
+        |---|---|---|---|
+        | `pending` | Criado, cobrança ainda não concluída | — | não |
+        | `paid` | Cobrança aprovada | — | não |
+        | `declined` | O gateway respondeu "não". Erro **esperado** | não, a resposta não vai mudar | não |
+        | `failed` | O gateway não respondeu, ou deu 500. Erro **inesperado** | sim | sim |
+
+    PaymentEvent:
+      type: object
+      required: [event_id, type, order_id, payment_id, status]
+      properties:
+        event_id:
+          type: string
+          maxLength: 64
+          description: |
+            Identifica o **evento**, não a entrega. Reenvios repetem o mesmo
+            valor — é nele que a Fase 3 põe um `UNIQUE`.
+          examples: [evt_e2b497b5bb0c42e0]
+        type:
+          type: string
+          maxLength: 64
+          enum: [payment.succeeded, payment.failed]
+        order_id:
+          type: string
+          format: uuid
+        payment_id:
+          type: string
+          maxLength: 64
+          examples: [pay_ede9d00436c4ea2c]
+        status:
+          type: string
+          maxLength: 20
+          enum: [approved, declined]
+        occurred_at:
+          type: [string, 'null']
+          format: date-time
+          description: |
+            Quando o evento aconteceu **no gateway**. É por este campo que se
+            ordena, não pela hora de chegada: a Fase 3 precisa disso para não
+            deixar um evento velho sobrescrever um novo.
+
+    ProblemDetails:
+      type: object
+      description: |
+        RFC 9457. **Ainda não é o formato real das respostas de erro** — a Fase
+        2 é que vai adotá-lo de verdade, com `Content-Type:
+        application/problem+json`. Hoje só o 400 de `Idempotency-Key` ausente
+        se parece com isto, e mesmo assim como `application/json`.
+      properties:
+        type:
+          type: string
+          format: uri-reference
+          description: URI que identifica o tipo do problema.
+          examples: ['about:blank']
+        title:
+          type: string
+          examples: ['Idempotency-Key obrigatório']
+        status:
+          type: integer
+          examples: [400]
+        detail:
+          type: string
+          description: Explicação desta ocorrência específica.
+
+    ValidationError:
+      type: object
+      description: Formato padrão do Laravel para falha de validação.
+      properties:
+        message:
+          type: string
+        errors:
+          type: object
+          additionalProperties:
+            type: array
+            items:
+              type: string
+
+  responses:
+    IdempotencyKeyAusente:
+      description: |
+        O header `Idempotency-Key` não foi enviado. Produzido pelo middleware
+        `App\Http\Middleware\Idempotency`.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+          example:
+            type: about:blank
+            title: Idempotency-Key obrigatório
+            status: 400
+            detail: >-
+              Esta rota exige o header Idempotency-Key para que você possa
+              repetir a requisição com segurança depois de um timeout.
+
+    ErroDeValidacao:
+      description: |
+        Payload inválido. Erro **esperado**: responde ao cliente e não deveria
+        gerar alerta nem acordar ninguém (Fase 2, `dontReport`).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ValidationError'
+          example:
+            message: The amount cents field must be at least 1. (and 2 more errors)
+            errors:
+              amount_cents: ['The amount cents field must be at least 1.']
+              currency: ['The selected currency is invalid.']
+              customer_email: ['The customer email field is required.']
+
+    GatewayIndisponivel:
+      description: |
+        O gateway respondeu 5xx, ou não respondeu. O pedido fica com status
+        `failed`.
+
+        **Este é o comportamento feio que a Fase 2 vai consertar.** Hoje é um
+        `RuntimeException` cru: com `APP_DEBUG=true` o corpo traz `exception`,
+        `file`, `line` e o stack trace inteiro — exatamente o que um cliente
+        não deveria ver. Vai virar `502`/`503` em Problem Details, depois de
+        retry com backoff.
+
+        Reproduza: `GATEWAY_FAIL_RATE=1` no `.env` da raiz e
+        `docker compose up -d gateway`.
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              message:
+                type: string
+                examples: ['gateway respondeu 500']
+              exception:
+                type: string
+                examples: [RuntimeException]
+              file:
+                type: string
+              line:
+                type: integer
+              trace:
+                type: array
+                items:
+                  type: object

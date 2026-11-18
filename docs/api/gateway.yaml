@@ -1,0 +1,421 @@
+openapi: 3.1.0
+
+# =============================================================================
+# O gateway de pagamento FAKE. Existe para falhar.
+#
+# Está documentado porque o contrato de caos dele é uma ferramenta de estudo:
+# é com estes headers e variáveis que você provoca timeout, 500, recusa e
+# webhook duplicado sob demanda, em vez de esperar o azar.
+# =============================================================================
+
+info:
+  title: Fake Payment Gateway
+  version: 0.1.0
+  summary: Gateway de pagamento que falha de propósito, sob comando.
+  description: |
+    PHP puro, sem framework, um arquivo só (`gateway/public/index.php`). Roda
+    em container próprio porque **timeout e erro de conexão só existem se
+    houver rede no meio** — um gateway que fosse uma função do mesmo processo
+    não serviria para estudar nada disso.
+
+    ### Ele NÃO é idempotente, de propósito
+
+    Chamar `POST /charge` duas vezes com os mesmos dados gera **duas
+    cobranças**. Isso não é um bug a corrigir aqui: é o que dá valor ao teste
+    da Fase 3. Quem precisa garantir "uma cobrança por pedido" é a aplicação,
+    e o contador em `GET /_stats` é a régua que prova se ela garantiu.
+
+    ### Duas formas de ligar o caos
+
+    | Como | Alcance | Quando usar |
+    |---|---|---|
+    | Variáveis no `.env` da raiz | Todas as chamadas, até mudar | Cenário sustentado ("o gateway está degradado há 2 minutos") |
+    | Headers `X-Chaos-*` | Só naquela chamada | Caso pontual, sem reiniciar container |
+
+    Depois de mexer no `.env`: `docker compose up -d gateway`.
+
+    ### Taxas, não booleanos
+
+    `fail_rate`, `decline_rate` e `timeout_rate` vão de `0` a `1`. `0.3` é 30%
+    das chamadas. Isso importa: falha intermitente é bem mais difícil de
+    investigar do que falha total, e é o caso realista.
+
+servers:
+  - url: http://localhost:8011
+    description: Porta publicada pelo Docker Compose
+  - url: http://gateway:8080
+    description: Como a aplicação o enxerga, dentro da rede do Compose
+
+tags:
+  - name: Cobrança
+  - name: Caos
+    description: Endpoints de apoio ao estudo. Um gateway real não teria isso.
+
+paths:
+  /charge:
+    post:
+      tags: [Cobrança]
+      operationId: charge
+      summary: Cobra um pedido
+      description: |
+        A ordem em que as falhas são avaliadas é fixa, e importa para entender
+        o que você vai observar:
+
+        1. `latency_ms` — dorme, sempre
+        2. `timeout_rate` — dorme `timeout_sleep_ms` e responde `504`
+        3. `fail_rate` — responde `500`
+        4. `decline_rate` — responde `402`
+        5. caso contrário, aprova e responde `200`
+
+        Nos casos 3, 4 e 5 o contador de `/_stats` é incrementado: do ponto de
+        vista do gateway, a **tentativa aconteceu**. É isso que torna visível o
+        retry que cobra duas vezes.
+
+        Em aprovação e em recusa, o gateway agenda o webhook (veja a seção
+        `webhooks` desta spec). Em `500` e `504`, não — e essa assimetria é
+        proposital: é o caso em que a aplicação não sabe se foi cobrada e não
+        vai receber confirmação nenhuma.
+      parameters:
+        - $ref: '#/components/parameters/XRequestId'
+        - name: traceparent
+          in: header
+          description: |
+            W3C Trace Context. Hoje o gateway apenas **registra** o valor no
+            log e o repassa para o webhook. A Fase 4 fecha o trace de verdade.
+          schema:
+            type: string
+        - name: X-Chaos-Latency-Ms
+          in: header
+          description: Latência fixa, em milissegundos, só nesta chamada.
+          schema:
+            type: integer
+            examples: [3000]
+        - name: X-Chaos-Fail-Rate
+          in: header
+          description: '`1` garante um 500. Erro **inesperado**: pode retentar.'
+          schema:
+            type: number
+            minimum: 0
+            maximum: 1
+        - name: X-Chaos-Decline-Rate
+          in: header
+          description: '`1` garante um 402. Erro **esperado**: não retente.'
+          schema:
+            type: number
+            minimum: 0
+            maximum: 1
+        - name: X-Chaos-Timeout-Rate
+          in: header
+          description: '`1` garante que ele durma mais que o seu timeout.'
+          schema:
+            type: number
+            minimum: 0
+            maximum: 1
+        - name: X-Chaos-Timeout-Sleep-Ms
+          in: header
+          description: Quanto ele dorme no caso de timeout. Default 30000.
+          schema:
+            type: integer
+        - name: X-Chaos-Duplicate-Webhook
+          in: header
+          description: |
+            Quantos webhooks **extra** enviar, com o mesmo `event_id`. `2`
+            significa 3 entregas no total.
+          schema:
+            type: integer
+            minimum: 0
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [order_id, amount_cents]
+              properties:
+                order_id:
+                  type: string
+                  description: Aceita qualquer string, não valida UUID.
+                amount_cents:
+                  type: integer
+                  minimum: 1
+                currency:
+                  type: string
+                idempotency_key:
+                  type: [string, 'null']
+                  description: |
+                    A aplicação já manda. O gateway **ignora**, de propósito:
+                    o objetivo é você sentir a falta.
+      responses:
+        '200':
+          description: Cobrança aprovada. Webhook `payment.succeeded` agendado.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  payment_id:
+                    type: string
+                    examples: [pay_ede9d00436c4ea2c]
+                  status:
+                    type: string
+                    const: approved
+                  order_id:
+                    type: string
+                  amount_cents:
+                    type: integer
+                  charged_at:
+                    type: string
+                    format: date-time
+        '400':
+          description: |
+            `order_id` ausente ou `amount_cents` <= 0. Erro do **cliente**:
+            retentar é desperdício, a resposta nunca vai mudar.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GatewayError'
+        '402':
+          description: |
+            Recusado. Resposta **legítima** do gateway, não uma falha dele.
+            Webhook `payment.failed` agendado.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    const: card_declined
+                  status:
+                    type: string
+                    const: declined
+                  decline_code:
+                    type: string
+                    examples: [insufficient_funds]
+                  payment_id:
+                    type: string
+                  order_id:
+                    type: string
+        '500':
+          description: |
+            Erro **inesperado** e transitório. A tentativa foi contada em
+            `/_stats`, então pode ter cobrado antes de explodir — é a ambiguidade
+            que faz retry sem idempotência ser perigoso.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GatewayError'
+        '504':
+          description: |
+            Ele dormiu mais que o seu timeout e respondeu depois. Na prática
+            você nem vê este 504: o seu cliente HTTP já desistiu. Nenhum
+            webhook é enviado.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GatewayError'
+
+  /health:
+    get:
+      tags: [Caos]
+      operationId: gatewayHealth
+      summary: Estado e configuração de caos em vigor
+      responses:
+        '200':
+          description: Config resolvida a partir das variáveis de ambiente.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    const: ok
+                  chaos:
+                    $ref: '#/components/schemas/ChaosConfig'
+
+  /_stats:
+    get:
+      tags: [Caos]
+      operationId: gatewayStats
+      summary: Quantas cobranças ele recebeu
+      description: |
+        **A régua do teste da Fase 3.** Contadores globais e por `order_id`,
+        guardados num arquivo com `flock` (o servidor roda vários processos,
+        então um contador em memória contaria errado).
+
+        O teste que fecha a Fase 3 — 20 requisições simultâneas com a mesma
+        `Idempotency-Key` — está correto quando `attempts_total` for `1`.
+        Hoje dá 20.
+      responses:
+        '200':
+          description: Contadores.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  attempts_total:
+                    type: integer
+                  approved_total:
+                    type: integer
+                  declined_total:
+                    type: integer
+                  failed_total:
+                    type: integer
+                  timeout_total:
+                    type: integer
+                  by_order:
+                    type: object
+                    additionalProperties:
+                      type: object
+                      properties:
+                        attempts:
+                          type: integer
+                        approved:
+                          type: integer
+                        declined:
+                          type: integer
+                        failed:
+                          type: integer
+                        timeout:
+                          type: integer
+              example:
+                attempts_total: 3
+                approved_total: 1
+                declined_total: 1
+                failed_total: 1
+                timeout_total: 0
+                by_order:
+                  01a1ef36-69f0-7128-819b-2f9d7a625b18:
+                    attempts: 1
+                    approved: 1
+
+  /_reset:
+    post:
+      tags: [Caos]
+      operationId: gatewayReset
+      summary: Zera os contadores
+      description: Rode antes de cada medição, para o número não acumular.
+      responses:
+        '200':
+          description: Zerado.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    const: reset
+
+webhooks:
+  paymentEvent:
+    post:
+      operationId: emitPaymentEvent
+      summary: O que o gateway ENVIA de volta para a aplicação
+      description: |
+        Entregue por um processo separado (`gateway/bin/send_webhook.php`),
+        para não bloquear a resposta do `/charge`. Destino configurável em
+        `GATEWAY_WEBHOOK_URL`; por padrão `http://nginx/webhooks/payments`.
+
+        Três comportamentos que a aplicação precisa suportar:
+
+        1. **Atraso.** `GATEWAY_WEBHOOK_DELAY_MS` (default 400ms). Aumente e o
+           webhook chega bem depois da resposta HTTP. Diminua para zero e ele
+           pode chegar **antes** de a aplicação ter terminado de salvar o
+           resultado da cobrança — o pedido ainda está `pending` quando a
+           confirmação bate na porta.
+        2. **Duplicata.** `GATEWAY_DUPLICATE_WEBHOOK=2` manda 3 entregas, com
+           150ms entre elas e o **mesmo `event_id`**. O header
+           `X-Gateway-Delivery` diz `1/3`, `2/3`, `3/3`.
+        3. **Nenhuma entrega.** Em `500` e `504` não há webhook. A aplicação
+           fica sem confirmação e sem saber se foi cobrada.
+      parameters:
+        - name: X-Gateway-Event-Id
+          in: header
+          schema:
+            type: string
+        - name: X-Gateway-Delivery
+          in: header
+          description: '`n/total` desta entrega.'
+          schema:
+            type: string
+            examples: ['2/3']
+        - name: X-Request-Id
+          in: header
+          description: |
+            O gateway devolve o id que recebeu no `/charge`. É por isso que já
+            na Fase 0 dá para seguir uma requisição do `curl` até o webhook.
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [event_id, type, payment_id, order_id, status]
+              properties:
+                event_id:
+                  type: string
+                type:
+                  type: string
+                  enum: [payment.succeeded, payment.failed]
+                payment_id:
+                  type: string
+                order_id:
+                  type: string
+                amount_cents:
+                  type: integer
+                status:
+                  type: string
+                  enum: [approved, declined]
+                occurred_at:
+                  type: string
+                  format: date-time
+      responses:
+        '200':
+          description: |
+            A aplicação confirmou. O gateway só registra o status no log — ele
+            **não** reentrega em caso de erro, diferente de um gateway real.
+            Se quiser estudar reentrega, é o `copies` que simula.
+
+components:
+  parameters:
+    XRequestId:
+      name: X-Request-Id
+      in: header
+      required: false
+      description: Repassado para o log do gateway e para o webhook.
+      schema:
+        type: string
+
+  schemas:
+    GatewayError:
+      type: object
+      properties:
+        error:
+          type: string
+          examples: [internal_error, gateway_timeout, invalid_request]
+        message:
+          type: string
+          examples: ['explodi de proposito']
+
+    ChaosConfig:
+      type: object
+      properties:
+        latency_ms:
+          type: integer
+        fail_rate:
+          type: number
+        decline_rate:
+          type: number
+        timeout_rate:
+          type: number
+        timeout_sleep_ms:
+          type: integer
+        duplicate_webhook:
+          type: integer
+        webhook_delay_ms:
+          type: integer
