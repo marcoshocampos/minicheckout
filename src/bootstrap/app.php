@@ -17,9 +17,12 @@ return Application::configure(basePath: dirname(__DIR__))
         health: '/up',
     )
     ->withMiddleware(function (Middleware $middleware): void {
-        // FASE 1: aqui entra o middleware de X-Request-Id, aplicado ao grupo
-        // inteiro — ele tem que rodar ANTES de qualquer coisa que logue.
-        //   $middleware->prepend(\App\Http\Middleware\RequestId::class);
+        // FASE 1 — já ligado, o corpo do middleware é que está vazio.
+        //
+        // prepend() e não appendToGroup(): global, porque um 500 que estoura
+        // antes do roteamento também precisa de id; e primeiro da fila, para
+        // que tudo que logar depois já enxergue o contexto.
+        $middleware->prepend(\App\Http\Middleware\RequestId::class);
     })
     ->withExceptions(function (Exceptions $exceptions): void {
         // Sem o prefixo /api, o Laravel só devolve JSON quando o cliente pede

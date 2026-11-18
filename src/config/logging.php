@@ -102,6 +102,24 @@ return [
             'processors' => [PsrLogMessageProcessor::class],
         ],
 
+        /*
+        |----------------------------------------------------------------------
+        | FASE 1 — este é o canal que o projeto usa (LOG_CHANNEL=stderr).
+        |----------------------------------------------------------------------
+        |
+        | PASSO 1 do log em JSON é uma variável de ambiente, não código. Em
+        | src/.env:
+        |
+        |     LOG_STDERR_FORMATTER=Monolog\Formatter\JsonFormatter
+        |
+        | Isso já te dá uma linha por evento, com message, level, channel,
+        | datetime, context e extra. O `request_id` do Context cai em `extra`.
+        |
+        | PASSO 2 (opcional) é moldar esse JSON: descomente o `tap` abaixo e
+        | implemente App\Logging\FormatLogsAsJson. Faça o passo 1 primeiro e
+        | olhe a saída: talvez ela já te sirva, e aí o passo 2 não é
+        | necessário.
+        */
         'stderr' => [
             'driver' => 'monolog',
             'level' => env('LOG_LEVEL', 'debug'),
@@ -111,6 +129,7 @@ return [
             ],
             'formatter' => env('LOG_STDERR_FORMATTER'),
             'processors' => [PsrLogMessageProcessor::class],
+            // 'tap' => [App\Logging\FormatLogsAsJson::class],
         ],
 
         'syslog' => [
