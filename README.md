@@ -17,6 +17,7 @@ Documentos de fase:
 
 - [Fase 0 — Setup](docs/fase-0-setup.md)
 - [Fase 1 — Logs estruturados e correlação](docs/fase-1-logs-e-correlacao.md)
+- [Fase 2 — Tratamento de erros](docs/fase-2-tratamento-de-erros.md)
 
 ### As APIs (Swagger)
 
@@ -175,6 +176,51 @@ docker compose exec app php vendor/bin/phpunit
 O como e o porquê estão em
 [docs/fase-1-logs-e-correlacao.md](docs/fase-1-logs-e-correlacao.md).
 
+## O teste observável da Fase 2
+
+Gateway fora por 2 minutos, com as três vistas do mesmo incidente (o que o
+cliente vê, o que o log mostra, o que aconteceu de verdade):
+
+```bash
+INTERVAL=30 ./scripts/gateway-down.sh 120 down
+```
+
+São cinco modos, e cada um exerce uma linha diferente da tabela de decisão:
+
+| Modo | O gateway | A aplicação | O pedido |
+|---|---|---|---|
+| `down` | container parado: conexão recusada | retenta 3x → **503** | `failed` |
+| `unavailable` | responde `503` ("não processei") | retenta 3x → **503** | `failed` |
+| `fail` | responde `500` ("explodi") | **não** retenta → **504** | `unknown` |
+| `timeout` | dorme mais que o nosso timeout | **não** retenta → **504** | `unknown` |
+| `latency` | responde certo, 3s depois | degradação, não falha | `paid` |
+
+A diferença entre `503` e `504` é a fase inteira: no 503 há **prova** de que
+nada foi cobrado, então retentar e repetir são seguros; no 504 a cobrança saiu
+e pode ter acontecido.
+
+O modo `unavailable` é o que mostra o preço do retry — `attempts_total: 3` no
+`/_stats` do gateway para **uma** requisição do cliente:
+
+```bash
+./scripts/gateway-down.sh 30 unavailable
+```
+
+A outra metade da fase é a fila. Com `NOTIFICATION_FAIL_RATE=1` em `src/.env`
+e `docker compose restart worker`, um pedido aprovado gera 4 tentativas de
+notificação (intervalos 2s, 8s, 8s) e vira linha na dead letter queue:
+
+```bash
+./scripts/dead-letter.sh
+```
+
+Ela imprime o `request_id` que estava **dentro do payload do job** e o comando
+`follow-request.sh` pronto: da linha da dead letter você volta para a
+requisição HTTP inteira, de horas antes, em outro processo.
+
+O como e o porquê estão em
+[docs/fase-2-tratamento-de-erros.md](docs/fase-2-tratamento-de-erros.md).
+
 ## Ligando o caos
 
 Permanente, para todas as chamadas — edite o `.env` da raiz e recarregue só o
@@ -189,7 +235,8 @@ estes headers são para você bater **direto** no gateway:
 
 | Header | Efeito |
 |---|---|
-| `X-Chaos-Fail-Rate: 1` | 500 garantido |
+| `X-Chaos-Fail-Rate: 1` | falha garantida, no status abaixo |
+| `X-Chaos-Fail-Status: 503` | `500` (default, pode ter cobrado) ou `503` (não processou) |
 | `X-Chaos-Decline-Rate: 1` | 402 (recusa) garantido |
 | `X-Chaos-Timeout-Rate: 1` | dorme `GATEWAY_TIMEOUT_SLEEP_MS` |
 | `X-Chaos-Latency-Ms: 3000` | 3s de latência |

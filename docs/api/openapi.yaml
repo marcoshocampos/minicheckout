@@ -15,7 +15,7 @@ openapi: 3.1.0
 
 info:
   title: Mini Checkout API
-  version: 0.3.0
+  version: 0.4.0
   summary: Criação de pedidos com cobrança, notificação assíncrona e webhook.
   description: |
     API de um projeto de **estudo**. O domínio é propositalmente minúsculo: a
@@ -23,21 +23,41 @@ info:
     fila, webhook), que é onde observabilidade, rastreabilidade, tratamento de
     erros e idempotência importam.
 
-    ### Estado atual: Fase 1 concluída
+    ### Estado atual: Fase 2 concluída
 
     | Fase | Assunto | Estado |
     |---|---|---|
     | 0 | Setup, domínio mínimo, gateway fake | concluída |
     | 1 | Logs estruturados e correlação | concluída |
-    | 2 | Tratamento de erros, Problem Details, retry | pendente |
+    | 2 | Tratamento de erros, Problem Details, retry | concluída |
     | 3 | Idempotência (requisição, webhook e job) | pendente |
     | 4 | Tracing distribuído | pendente |
     | 5 | Métricas e alertas | pendente |
 
-    O que isso significa para quem lê: **as respostas de erro ainda não são
-    Problem Details** (RFC 9457) e **o `Idempotency-Key` ainda não deduplica
-    nada** — hoje ele é só obrigatório. As duas coisas estão marcadas nos
-    endpoints.
+    O que isso significa para quem lê: **todo erro é Problem Details** (RFC
+    9457, com `Content-Type: application/problem+json`), mas o
+    `Idempotency-Key` **ainda não deduplica nada** — hoje ele é só
+    obrigatório. A Fase 3 resolve, e é por isso que o `504` abaixo pede para
+    você *consultar* o pedido em vez de repetir a cobrança.
+
+    ### Os tipos de problema
+
+    O campo `type` é a chave estável para o cliente tratar erro
+    programaticamente. Esta API usa:
+
+    | `type` | status | significa |
+    |---|---|---|
+    | `/problems/missing-idempotency-key` | 400 | falta o header obrigatório |
+    | `/problems/validation` | 422 | payload inválido (campos em `errors`) |
+    | `/problems/payment-declined` | 402 | o gateway disse "não" |
+    | `/problems/gateway-unavailable` | 503 | não cobramos; pode repetir |
+    | `/problems/payment-unconfirmed` | 504 | **não sabemos** se cobramos |
+    | `/problems/internal` | 5xx | erro nosso, inesperado |
+    | `about:blank` | 404, 405, 415, 429 | o status já diz tudo |
+
+    A diferença entre `503` e `504` é a mais importante da API: no `503` a
+    cobrança **não aconteceu** e repetir é seguro; no `504` ela pode ter
+    acontecido, e repetir pode cobrar duas vezes.
 
     ### Correlação
 
@@ -84,10 +104,32 @@ paths:
         nada: mandar a mesma chave duas vezes cria **dois** pedidos e gera
         **duas** cobranças. Isso é intencional e é o ponto de partida da Fase 3.
 
+        #### Quanto tempo esta chamada pode levar
+
+        A cobrança é síncrona e **pode ser retentada** por nós antes de a
+        resposta sair. O orçamento é `3 tentativas x 3s de timeout + backoff`,
+        ou seja **até ~10s** no pior caso.
+
+        Nós só retentamos quando há prova de que a cobrança não foi
+        processada: erro de conexão, ou um `408`/`429`/`503` do gateway. Um
+        `500` do gateway, ou um timeout de leitura, **não** são retentados —
+        podem já ter cobrado.
+
+        #### O que fazer com cada erro
+
+        | status | repetir a requisição? |
+        |---|---|
+        | `400`, `422` | só depois de corrigir o payload |
+        | `402` | não: a resposta não vai mudar; troque o meio de pagamento |
+        | `503` | **sim**, respeitando o `Retry-After`. Nada foi cobrado |
+        | `504` | **não**. Consulte `GET /orders/{id}` (veja `instance`) |
+        | `500` | não automaticamente; informe o `request_id` |
+
         #### O que ainda falta no contrato
 
-        - Erros em `application/problem+json`: Fase 2
         - `409` e `422` por chave repetida, e replay da resposta salva: Fase 3
+        - quando a Fase 3 existir, o `504` passa a poder ser repetido com a
+          **mesma** `Idempotency-Key` com segurança
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
         - $ref: '#/components/parameters/XRequestId'
@@ -107,9 +149,12 @@ paths:
       responses:
         '201':
           description: |
-            Pedido criado. Atenção: **também é 201 quando o pagamento é
-            recusado** — o pedido foi criado, o pagamento é que foi negado.
-            Olhe o campo `status`, não só o código HTTP.
+            Pedido criado **e pago**.
+
+            Mudou na Fase 2: antes isto também era a resposta de uma cobrança
+            recusada (com `status: declined` no corpo), o que fazia um cliente
+            que olha só o código HTTP achar que tinha vendido. Recusa agora é
+            `402`.
           headers:
             X-Request-Id:
               $ref: '#/components/headers/XRequestIdResponse'
@@ -131,25 +176,18 @@ paths:
                     paid_at: '2026-11-18T15:11:24.000000Z'
                     notified_at: null
                     created_at: '2026-11-18T15:11:23.000000Z'
-                recusado:
-                  summary: Cobrança recusada (erro esperado)
-                  value:
-                    id: 01a1ef36-7a10-71c2-9f3e-1b8c0d4e5f60
-                    status: declined
-                    amount_cents: 1990
-                    currency: BRL
-                    customer_email: eu@example.test
-                    payment_id: pay_2b3ce738b3ac92d4
-                    decline_reason: insufficient_funds
-                    paid_at: null
-                    notified_at: null
-                    created_at: '2026-11-18T15:12:01.000000Z'
         '400':
           $ref: '#/components/responses/IdempotencyKeyAusente'
+        '402':
+          $ref: '#/components/responses/PagamentoRecusado'
         '422':
           $ref: '#/components/responses/ErroDeValidacao'
         '500':
+          $ref: '#/components/responses/ErroInterno'
+        '503':
           $ref: '#/components/responses/GatewayIndisponivel'
+        '504':
+          $ref: '#/components/responses/PagamentoSemConfirmacao'
 
   /orders/{id}:
     get:
@@ -159,6 +197,11 @@ paths:
       description: |
         Útil para ver o `notified_at` depois de o job da fila rodar, e para
         acompanhar a mudança de status quando o webhook do gateway chega.
+
+        **É também a resposta ao `504`**: quando o `POST /orders` devolve
+        `/problems/payment-unconfirmed`, o `instance` do problema aponta para
+        cá. Consultar é o que você faz em vez de repetir a cobrança — pelo
+        menos até a Fase 3 tornar a repetição segura.
       parameters:
         - name: id
           in: path
@@ -179,20 +222,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/Order'
         '404':
-          description: |
-            Pedido inexistente. O corpo vem do handler padrão do Laravel e
-            **não** é Problem Details ainda (Fase 2).
-          headers:
-            X-Request-Id:
-              $ref: '#/components/headers/XRequestIdResponse'
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  message:
-                    type: string
-                    examples: ['No query results for model [App\Models\Order].']
+          $ref: '#/components/responses/NaoEncontrado'
 
   /webhooks/payments:
     post:
@@ -310,6 +340,23 @@ components:
         type: string
         examples: ['01KA7Z4R8P3Q1T6V9W2X5Y8Z0B']
 
+    RetryAfter:
+      description: |
+        Quantos segundos esperar antes de repetir a requisição.
+
+        Vem **só** no `503` (`/problems/gateway-unavailable`), porque só ali
+        nós sabemos que a cobrança não aconteceu. O `504` não traz este header
+        de propósito: ele é um convite a repetir, e repetir é o que pode
+        cobrar duas vezes enquanto a Fase 3 não existir.
+
+        O valor é fixo hoje, o que sincroniza todos os clientes no mesmo
+        segundo. Um valor com jitter espalharia a volta — é a mesma discussão
+        do backoff do nosso retry, vista do outro lado do fio.
+      required: false
+      schema:
+        type: integer
+        examples: [5]
+
   parameters:
     IdempotencyKey:
       name: Idempotency-Key
@@ -415,17 +462,25 @@ components:
 
     OrderStatus:
       type: string
-      enum: [pending, paid, declined, failed]
+      enum: [pending, paid, declined, failed, unknown]
       description: |
-        `declined` e `failed` são coisas diferentes, e a distinção é o assunto
-        da Fase 2:
+        `declined`, `failed` e `unknown` são três coisas diferentes, e a
+        distinção é o assunto da Fase 2:
 
-        | Status | O que aconteceu | Retentar? | Vira incidente? |
+        | Status | O que aconteceu | Repetir é seguro? | Vira incidente? |
         |---|---|---|---|
-        | `pending` | Criado, cobrança ainda não concluída | — | não |
+        | `pending` | Criado, cobrança ainda não tentada | — | não |
         | `paid` | Cobrança aprovada | — | não |
-        | `declined` | O gateway respondeu "não". Erro **esperado** | não, a resposta não vai mudar | não |
-        | `failed` | O gateway não respondeu, ou deu 500. Erro **inesperado** | sim | sim |
+        | `declined` | O gateway respondeu "não". Erro **esperado** | repetir não muda o resultado | não |
+        | `failed` | Não cobramos, e temos **prova** disso | sim | sim (`warning`) |
+        | `unknown` | A cobrança saiu e **não sabemos** o resultado | **não** | sim (`critical`) |
+
+        `unknown` entrou na Fase 2 e é o estado que quase nenhum sistema
+        modela. Ele existe nos dados, e não só na resposta HTTP, por dois
+        motivos: guardá-lo como `failed` faz alguém escrever um dia
+        "reprocessa todos os failed" e cobrar de novo quem já foi cobrado;
+        guardá-lo como `pending` o torna indistinguível de um pedido que nem
+        tentou. É a fila de reconciliação que a Fase 3 vai consumir.
 
     PaymentEvent:
       type: object
@@ -464,109 +519,271 @@ components:
     ProblemDetails:
       type: object
       description: |
-        RFC 9457. **Ainda não é o formato real das respostas de erro** — a Fase
-        2 é que vai adotá-lo de verdade, com `Content-Type:
-        application/problem+json`. Hoje só o 400 de `Idempotency-Key` ausente
-        se parece com isto, e mesmo assim como `application/json`.
+        RFC 9457 — "Problem Details for HTTP APIs". É o formato de **toda**
+        resposta de erro desta API desde a Fase 2, sempre com
+        `Content-Type: application/problem+json`.
+
+        O content-type é metade da especificação: o cliente sabe que recebeu
+        erro estruturado olhando só o header, sem inspecionar o corpo.
+
+        A RFC permite **membros de extensão** (§3.2), e é por essa porta que
+        entram o `request_id` (em todos) e campos específicos de cada tipo,
+        como `order_id`, `decline_code` e `errors`.
+      required: [type, title, status, request_id]
       properties:
         type:
           type: string
           format: uri-reference
-          description: URI que identifica o tipo do problema.
-          examples: ['about:blank']
+          description: |
+            URI que identifica o **tipo** do problema. É a chave que o cliente
+            usa no `if`, e é estável: mudar o `type` é quebra de contrato.
+            `about:blank` significa "não há nada além do que o status HTTP já
+            diz".
+          examples: ['/problems/gateway-unavailable']
         title:
           type: string
-          examples: ['Idempotency-Key obrigatório']
+          description: |
+            Resumo legível do tipo — do TIPO, não da ocorrência: não muda de
+            requisição para requisição.
+          examples: ['Gateway de pagamento indisponível']
         status:
           type: integer
-          examples: [400]
+          description: |
+            O mesmo status da resposta HTTP, duplicado de propósito: o corpo
+            pode ser guardado, logado ou encaminhado longe do response.
+          examples: [503]
         detail:
           type: string
-          description: Explicação desta ocorrência específica.
-
-    ValidationError:
-      type: object
-      description: Formato padrão do Laravel para falha de validação.
-      properties:
-        message:
+          description: |
+            O que aconteceu nesta ocorrência. Para humano ler, não para código
+            comparar — use o `type` no `if`.
+        instance:
           type: string
-        errors:
-          type: object
-          additionalProperties:
-            type: array
-            items:
-              type: string
+          format: uri-reference
+          description: |
+            URI da ocorrência. Nos erros de pedido, aponta para o próprio
+            pedido: é o que torna o `504` acionável.
+          examples: ['/orders/01a1ef36-69f0-7128-819b-2f9d7a625b18']
+        request_id:
+          type: string
+          description: |
+            Membro de extensão presente em **todo** problema, com o mesmo
+            valor do header `X-Request-Id`. Está no corpo porque corpo de erro
+            é o que um cliente guarda em log ou cola num chamado — e é com ele
+            que se acha a requisição inteira, inclusive o job assíncrono.
+          examples: ['01KA7Z4R8P3Q1T6V9W2X5Y8Z0B']
+      additionalProperties: true
+
+    ValidationProblem:
+      description: |
+        O problema de validação: um `ProblemDetails` com o membro de extensão
+        `errors`.
+
+        Seguir a RFC não pode custar a informação que o cliente usa, então a
+        lista de campos do Laravel foi mantida — só mudou de lugar.
+      allOf:
+        - $ref: '#/components/schemas/ProblemDetails'
+        - type: object
+          required: [errors]
+          properties:
+            errors:
+              type: object
+              description: Um array de mensagens por campo inválido.
+              additionalProperties:
+                type: array
+                items:
+                  type: string
 
   responses:
     IdempotencyKeyAusente:
       description: |
         O header `Idempotency-Key` não foi enviado. Produzido pelo middleware
-        `App\Http\Middleware\Idempotency`.
+        `App\Http\Middleware\Idempotency`, antes de qualquer coisa acontecer.
       headers:
         X-Request-Id:
           $ref: '#/components/headers/XRequestIdResponse'
       content:
-        application/json:
+        application/problem+json:
           schema:
             $ref: '#/components/schemas/ProblemDetails'
           example:
-            type: about:blank
+            type: /problems/missing-idempotency-key
             title: Idempotency-Key obrigatório
             status: 400
             detail: >-
               Esta rota exige o header Idempotency-Key para que você possa
               repetir a requisição com segurança depois de um timeout.
+            request_id: 01KA7Z4R8P3Q1T6V9W2X5Y8Z0B
 
     ErroDeValidacao:
       description: |
-        Payload inválido. Erro **esperado**: responde ao cliente e não deveria
-        gerar alerta nem acordar ninguém (Fase 2, `dontReport`).
+        Payload inválido. Erro **esperado**: responde ao cliente e não gera
+        alerta nem acorda ninguém (`dontReport` em `bootstrap/app.php`).
       headers:
         X-Request-Id:
           $ref: '#/components/headers/XRequestIdResponse'
       content:
-        application/json:
+        application/problem+json:
           schema:
-            $ref: '#/components/schemas/ValidationError'
+            $ref: '#/components/schemas/ValidationProblem'
           example:
-            message: The amount cents field must be at least 1. (and 2 more errors)
+            type: /problems/validation
+            title: Dados inválidos
+            status: 422
+            detail: Um ou mais campos não passaram na validação. Veja `errors`.
+            request_id: 01KA7Z4R8P3Q1T6V9W2X5Y8Z0B
             errors:
               amount_cents: ['The amount cents field must be at least 1.']
               currency: ['The selected currency is invalid.']
               customer_email: ['The customer email field is required.']
 
-    GatewayIndisponivel:
+    PagamentoRecusado:
       description: |
-        O gateway respondeu 5xx, ou não respondeu. O pedido fica com status
-        `failed`.
+        O gateway recusou a cobrança. **O pedido foi criado** e fica
+        consultável, com `status: declined` e o motivo em `decline_reason`; o
+        `instance` do problema aponta para ele.
 
-        **Este é o comportamento feio que a Fase 2 vai consertar.** Hoje é um
-        `RuntimeException` cru: com `APP_DEBUG=true` o corpo traz `exception`,
-        `file`, `line` e o stack trace inteiro — exatamente o que um cliente
-        não deveria ver. Vai virar `502`/`503` em Problem Details, depois de
-        retry com backoff.
+        Erro **esperado**: repetir não muda o resultado, e isto não é
+        incidente — não vai para o log de erro nem conta na taxa de erro. Use
+        `decline_code` para decidir o que dizer ao usuário final.
 
-        Reproduza: `GATEWAY_FAIL_RATE=1` no `.env` da raiz e
+        Reproduza: `GATEWAY_DECLINE_RATE=1` no `.env` da raiz e
         `docker compose up -d gateway`.
       headers:
         X-Request-Id:
           $ref: '#/components/headers/XRequestIdResponse'
       content:
-        application/json:
+        application/problem+json:
           schema:
-            type: object
-            properties:
-              message:
-                type: string
-                examples: ['gateway respondeu 500']
-              exception:
-                type: string
-                examples: [RuntimeException]
-              file:
-                type: string
-              line:
-                type: integer
-              trace:
-                type: array
-                items:
-                  type: object
+            $ref: '#/components/schemas/ProblemDetails'
+          example:
+            type: /problems/payment-declined
+            title: Pagamento recusado
+            status: 402
+            detail: >-
+              O gateway recusou a cobrança. O pedido foi criado e está com
+              status `declined`. Repetir a mesma requisição não muda o
+              resultado: use outro meio de pagamento.
+            instance: /orders/01a1ef36-7a10-71c2-9f3e-1b8c0d4e5f60
+            order_id: 01a1ef36-7a10-71c2-9f3e-1b8c0d4e5f60
+            decline_code: insufficient_funds
+            payment_id: pay_2b3ce738b3ac92d4
+            request_id: 01KA7Z4R8P3Q1T6V9W2X5Y8Z0B
+
+    GatewayIndisponivel:
+      description: |
+        Não conseguimos falar com o gateway, e **a cobrança não aconteceu** —
+        conexão recusada, ou um `503` em que o próprio gateway diz que não
+        processou nada. O pedido fica com status `failed`.
+
+        Já retentamos (até 3 vezes, com backoff) antes de devolver isto.
+        Repetir a requisição é **seguro**: respeite o `Retry-After`.
+
+        Reproduza: `./scripts/gateway-down.sh 120 down` (ou o modo
+        `unavailable`, que é o `503`).
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestIdResponse'
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+          example:
+            type: /problems/gateway-unavailable
+            title: Gateway de pagamento indisponível
+            status: 503
+            detail: >-
+              Não conseguimos falar com o gateway de pagamento e a cobrança
+              não foi feita. O pedido ficou com status `failed`. Pode repetir
+              a requisição com a MESMA Idempotency-Key.
+            instance: /orders/01a1ef36-8b20-7244-b0e1-3c9d0e5f6a71
+            order_id: 01a1ef36-8b20-7244-b0e1-3c9d0e5f6a71
+            request_id: 01KA7Z4R8P3Q1T6V9W2X5Y8Z0B
+
+    PagamentoSemConfirmacao:
+      description: |
+        A cobrança **saiu** e não obtivemos resposta conclusiva: timeout de
+        leitura, ou um `500` do gateway (que pode ter cobrado antes de
+        explodir). O pedido fica com status `unknown`.
+
+        **Não repita.** Esta é a única resposta desta API que não vem com
+        `Retry-After`, e a ausência é intencional: enquanto o gateway não
+        honrar a `Idempotency-Key` (Fase 3), repetir pode cobrar duas vezes.
+        Consulte o pedido — o `instance` tem a URI.
+
+        Por isso também não houve retry do nosso lado: só retentamos quando há
+        prova de que a cobrança não foi processada.
+
+        Reproduza: `./scripts/gateway-down.sh 30 timeout` (ou o modo `fail`,
+        que é o `500`).
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestIdResponse'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+          example:
+            type: /problems/payment-unconfirmed
+            title: Pagamento sem confirmação
+            status: 504
+            detail: >-
+              Enviamos a cobrança e não obtivemos uma resposta conclusiva do
+              gateway. NÃO sabemos se o pagamento foi feito; o pedido ficou
+              com status `unknown`. Consulte o pedido antes de tentar pagar de
+              novo.
+            instance: /orders/01a1ef36-9c30-7355-c1f2-4d0e1f607b82
+            order_id: 01a1ef36-9c30-7355-c1f2-4d0e1f607b82
+            request_id: 01KA7Z4R8P3Q1T6V9W2X5Y8Z0B
+
+    ErroInterno:
+      description: |
+        Erro **inesperado** nosso: bug, banco fora, contrato quebrado com o
+        gateway. É reportado com stack trace **no log**, e o cliente recebe
+        só isto.
+
+        O que mudou na Fase 2: antes, com `APP_DEBUG=true`, o corpo trazia
+        `exception`, `file`, `line` e o stack trace inteiro. Agora o trace
+        nunca sai; em debug sai apenas o membro de extensão `debug`, com três
+        campos, e em produção (`APP_DEBUG=false`) nem isso.
+
+        O que o cliente tem para agir é o `request_id`: com ele, o log da
+        requisição inteira — nginx, aplicação, gateway e job — é recuperável
+        com `./scripts/follow-request.sh`.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestIdResponse'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+          example:
+            type: /problems/internal
+            title: Erro interno
+            status: 500
+            detail: >-
+              Erro inesperado do nosso lado. Nada foi perdido do seu pedido se
+              ele já existe; informe o `request_id` para investigarmos.
+            request_id: 01KA7Z4R8P3Q1T6V9W2X5Y8Z0B
+
+    NaoEncontrado:
+      description: |
+        Recurso inexistente.
+
+        O `type` é `about:blank` de propósito: o status já diz tudo o que há
+        para dizer (RFC 9457 §4.2.1). E não há `detail`, porque a mensagem
+        padrão do Eloquent vazaria o nome do model.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestIdResponse'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+          example:
+            type: about:blank
+            title: Não encontrado
+            status: 404
+            request_id: 01KA7Z4R8P3Q1T6V9W2X5Y8Z0B

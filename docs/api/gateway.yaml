@@ -63,7 +63,7 @@ paths:
 
         1. `latency_ms` — dorme, sempre
         2. `timeout_rate` — dorme `timeout_sleep_ms` e responde `504`
-        3. `fail_rate` — responde `500`
+        3. `fail_rate` — responde `fail_status` (`500` ou `503`)
         4. `decline_rate` — responde `402`
         5. caso contrário, aprova e responde `200`
 
@@ -92,11 +92,29 @@ paths:
             examples: [3000]
         - name: X-Chaos-Fail-Rate
           in: header
-          description: '`1` garante um 500. Erro **inesperado**: pode retentar.'
+          description: '`1` garante a falha do gateway, no status de `X-Chaos-Fail-Status`.'
           schema:
             type: number
             minimum: 0
             maximum: 1
+        - name: X-Chaos-Fail-Status
+          in: header
+          description: |
+            O status da falha: `500` (default) ou `503`. Os dois exigem
+            decisões OPOSTAS de quem chama, e é por isso que são
+            configuráveis separadamente:
+
+            - `500` — "explodi". Pode ter cobrado antes de explodir, então
+              **retentar é arriscado**. A aplicação responde `504`
+              (`/problems/payment-unconfirmed`) e grava o pedido como
+              `unknown`.
+            - `503` — "estou fora, não processei nada". **Retentar é seguro**,
+              e é o único cenário em que o `attempts_total` de `/_stats`
+              mostra 3 cobranças para 1 requisição do cliente.
+          schema:
+            type: integer
+            enum: [500, 503]
+            default: 500
         - name: X-Chaos-Decline-Rate
           in: header
           description: '`1` garante um 402. Erro **esperado**: não retente.'
@@ -397,7 +415,7 @@ components:
       properties:
         error:
           type: string
-          examples: [internal_error, gateway_timeout, invalid_request]
+          examples: [internal_error, unavailable, gateway_timeout, invalid_request]
         message:
           type: string
           examples: ['explodi de proposito']
@@ -409,6 +427,9 @@ components:
           type: integer
         fail_rate:
           type: number
+        fail_status:
+          type: integer
+          enum: [500, 503]
         decline_rate:
           type: number
         timeout_rate:

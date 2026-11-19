@@ -156,6 +156,9 @@ services:
     environment:
       GATEWAY_LATENCY_MS: ${GATEWAY_LATENCY_MS:-0}
       GATEWAY_FAIL_RATE: ${GATEWAY_FAIL_RATE:-0}
+      # 500 (pode ter cobrado: o app NÃO retenta) ou 503 ("não processei":
+      # o app retenta). Ver a tabela em app/Services/PaymentGateway.php.
+      GATEWAY_FAIL_STATUS: ${GATEWAY_FAIL_STATUS:-500}
       GATEWAY_DECLINE_RATE: ${GATEWAY_DECLINE_RATE:-0}
       GATEWAY_TIMEOUT_RATE: ${GATEWAY_TIMEOUT_RATE:-0}
       GATEWAY_TIMEOUT_SLEEP_MS: ${GATEWAY_TIMEOUT_SLEEP_MS:-30000}

@@ -33,22 +33,24 @@ class PaymentDeclined extends RuntimeException implements ProvidesProblem
     public function problem(): Problem
     {
         // ------------------------------------------------------------------
-        // FASE 2 — DECISÃO SUA, e é decisão de CONTRATO (mexe na spec):
+        // FASE 2 — DECISÃO TOMADA: 402, e não 201 com `status: declined`.
         //
-        // 402 aqui, ou 201 com `status: declined` no corpo (como está hoje no
-        // OrderController)? Os dois se defendem:
+        // Os dois se defendiam:
         //
         //   201  o PEDIDO foi criado com sucesso; pagamento negado é um
-        //        estado do recurso, não uma falha da requisição. Cliente
-        //        preguiçoso, que só olha o status HTTP, vai achar que deu
-        //        certo.
-        //   402  a INTENÇÃO do cliente (pagar) não se realizou. Cliente que
-        //        trata 4xx como erro acerta de graça. Mas 402 é status pouco
-        //        usado e há proxy que trata mal.
+        //        estado do recurso, não uma falha da requisição. Mas premia o
+        //        cliente preguiçoso com a resposta errada: quem olha só o
+        //        código HTTP conclui que deu certo.
+        //   402  a INTENÇÃO do cliente (pagar) não se realizou. Quem trata
+        //        4xx como erro acerta de graça. Custo: é status pouco usado,
+        //        e existe proxy que trata mal.
         //
-        // Se escolher 201, esta exceção não precisa ser lançada: fica aqui só
-        // como documentação do que é erro esperado. Escolher é obrigatório;
-        // ficar com as duas coisas ao mesmo tempo, não.
+        // Ganhou o 402 porque o modo de falhar dele é barulhento (o cliente
+        // vê um erro que não era erro) e o do 201 é silencioso (o cliente
+        // acha que vendeu). Entre as duas, escolha sempre a que falha alto.
+        //
+        // O `instance` aponta para o pedido: o recurso existe, está
+        // consultável, e é lá que está o `decline_reason` persistido.
         // ------------------------------------------------------------------
         return (new Problem(
             status: 402,
@@ -57,6 +59,7 @@ class PaymentDeclined extends RuntimeException implements ProvidesProblem
             detail: 'O gateway recusou a cobrança. O pedido foi criado e está '
                 . 'com status `declined`. Repetir a mesma requisição não muda '
                 . 'o resultado: use outro meio de pagamento.',
+            instance: "/orders/{$this->orderId}",
         ))
             ->with('order_id', $this->orderId)
             // `decline_code` é o campo que o cliente usa para decidir o que

@@ -43,23 +43,31 @@ class GatewayUnavailable extends RuntimeException implements ProvidesProblem
     public function problem(): Problem
     {
         // ------------------------------------------------------------------
-        // FASE 2 — DECISÃO SUA:
+        // FASE 2 — DECISÃO TOMADA: 503 com `Retry-After`.
         //
-        // 502 ou 503? A RFC 9110 separa assim:
+        // A RFC 9110 separa assim:
         //   502 Bad Gateway         — eu sou intermediário e recebi resposta
         //                             inválida de quem está atrás de mim
         //   503 Service Unavailable — eu não consigo atender AGORA, tente
         //                             depois. É o único que combina com
         //                             `Retry-After`.
         //
-        // E o Retry-After: quanto? Valor fixo é simples e sincroniza todos os
-        // clientes no mesmo segundo — a avalanche volta, agora vinda deles.
-        // Valor com jitter espalha. É a mesma discussão do retry no
-        // PaymentGateway, vista do outro lado do fio.
+        // Ganhou o 503 porque é o único que diz ao cliente o que fazer. E ele
+        // só pode dizer "tente de novo" porque esta classe significa
+        // exatamente "não cobramos" — o caso indeterminado é o
+        // PaymentUnconfirmed, e aquele NÃO leva Retry-After.
         //
-        // Não exponha `attempts`/`gatewayStatus` ao cliente sem pensar: é
-        // detalhe da sua infra, e detalhe de infra em contrato público é algo
-        // que você não vai poder mudar depois.
+        // O valor é fixo (5s) e por isso sincroniza: todos os clientes que
+        // comeram 503 no mesmo segundo voltam juntos no mesmo segundo
+        // seguinte, e a avalanche volta — agora vinda deles. O jitter que o
+        // PaymentGateway aplica nas NOSSAS tentativas é a mesma ideia, vista
+        // do outro lado do fio; aqui ele depende de o cliente respeitar o
+        // header. Um `Retry-After: 4..7` aleatório seria melhor, e é um bom
+        // primeiro exercício desta fase.
+        //
+        // `attempts` e `gatewayStatus` ficam FORA do corpo de propósito: são
+        // detalhe da nossa infra, e detalhe de infra em contrato público é
+        // algo que você não vai poder mudar depois. Eles vão para o log.
         // ------------------------------------------------------------------
         return (new Problem(
             status: 503,
@@ -68,6 +76,7 @@ class GatewayUnavailable extends RuntimeException implements ProvidesProblem
             detail: 'Não conseguimos falar com o gateway de pagamento e a '
                 . 'cobrança não foi feita. O pedido ficou com status `failed`. '
                 . 'Pode repetir a requisição com a MESMA Idempotency-Key.',
+            instance: "/orders/{$this->orderId}",
         ))
             ->with('order_id', $this->orderId)
             ->withHeader('Retry-After', '5');

@@ -55,6 +55,26 @@ use Illuminate\Support\Facades\Context;
  */
 class Problem implements Responsable
 {
+    /**
+     * Títulos em português para os status que esta API pode devolver sem ter
+     * uma exceção de domínio por trás (404, 405, 500...). São títulos do
+     * TIPO, não da ocorrência — por isso constantes, e não interpolação.
+     */
+    private const TITLES = [
+        400 => 'Requisição inválida',
+        401 => 'Não autenticado',
+        403 => 'Acesso negado',
+        404 => 'Não encontrado',
+        405 => 'Método não permitido',
+        409 => 'Conflito',
+        415 => 'Formato não suportado',
+        422 => 'Dados inválidos',
+        429 => 'Muitas requisições',
+        500 => 'Erro interno',
+        503 => 'Serviço indisponível',
+        504 => 'Tempo esgotado',
+    ];
+
     /** Membros de extensão da RFC (§3.2): request_id, order_id, etc. */
     private array $extensions = [];
 
@@ -68,6 +88,28 @@ class Problem implements Responsable
         public readonly ?string $detail = null,
         public readonly ?string $instance = null,
     ) {
+    }
+
+    /**
+     * O problema genérico de um status HTTP.
+     *
+     * É o que o funil `respond()` de bootstrap/app.php usa para traduzir o
+     * que NÃO é exceção de domínio — o 404 do route binding, o 405, o 500 de
+     * um bug — para o mesmo formato. Sem isto, a API volta a ter três
+     * formatos de erro e o cliente volta a ter três `if`.
+     *
+     * `type` fica em `about:blank` de propósito nos casos em que o status já
+     * diz tudo o que há para dizer (RFC 9457 §4.2.1): inventar uma URI de
+     * tipo para cada 404 é contrato a mais sem informação a mais.
+     */
+    public static function fromStatus(int $status, ?string $detail = null, string $type = 'about:blank'): self
+    {
+        return new self(
+            status: $status,
+            title: self::TITLES[$status] ?? 'Erro',
+            type: $type,
+            detail: $detail,
+        );
     }
 
     /** Membro de extensão. Valor null é ignorado, para não poluir o corpo. */

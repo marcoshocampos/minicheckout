@@ -2,182 +2,323 @@
 
 namespace App\Services;
 
+use App\Exceptions\GatewayUnavailable;
+use App\Exceptions\PaymentUnconfirmed;
 use App\Models\Order;
+use GuzzleHttp\Exception\ConnectException as GuzzleConnectException;
+use Illuminate\Http\Client\ConnectionException;
+use Illuminate\Http\Client\RequestException;
 use Illuminate\Http\Client\Response;
 use Illuminate\Support\Facades\Context;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
+use Psr\Http\Message\RequestInterface;
+use Throwable;
 
 /**
  * Cliente do gateway fake.
  *
- * FASE 0: deliberadamente ingênuo. Sem timeout, sem retry, sem tratamento.
- * Se o gateway pendurar, esta chamada pendura com ele e o seu cliente também.
- * Ligue `GATEWAY_LATENCY_MS=5000` e veja a requisição inteira travar.
- *
  * ===========================================================================
- * FASE 2 — TIMEOUT E RETRY: o que entra aqui
+ * FASE 2 — A DECISÃO DESTE ARQUIVO
  *
- * As alavancas já existem em config/services.php (`services.gateway.*`), com
- * env em src/.env. O que falta é usá-las, e escolher a política.
+ * Esta classe tem UMA responsabilidade conceitual: traduzir o que aconteceu no
+ * fio para uma das três respostas possíveis do mundo real.
  *
- *     return Http::acceptJson()
- *         ->timeout(config('services.gateway.timeout'))
- *         ->connectTimeout(config('services.gateway.connect_timeout'))
- *         ->retry(
- *             times: config('services.gateway.tries'),
- *             sleepMilliseconds: $backoff,     // closure, ver abaixo
- *             when: $retryable,                // closure, ver abaixo
- *             throw: false,
- *         )
- *         ->withHeaders([...])
- *         ->post($url, [...]);
+ *   sucesso        o gateway respondeu                    -> devolve a Response
+ *   NÃO cobrou     e nós temos prova disso                -> GatewayUnavailable
+ *   NÃO SABEMOS    pode ter cobrado                       -> PaymentUnconfirmed
  *
- * ---------------------------------------------------------------------------
- * 1. TIMEOUT: são DOIS, e eles medem coisas diferentes
+ * O terceiro estado é o que quase nenhum código tem, e é o que importa: quem
+ * junta "não cobrou" com "não sei" no mesmo `catch` acaba retentando um POST
+ * que pode ter movido dinheiro.
  *
- *    connectTimeout  só o aperto de mão TCP. Host morto, DNS errado, firewall
- *                    que descarta pacote caem aqui. Pode ser curto: 1s.
- *    timeout         o tempo TOTAL até a resposta completa. É o que protege
- *                    você do gateway que aceita a conexão e some.
+ * A regra desta classe, e é a única regra:
  *
- *    Sem `connectTimeout`, um host que não responde ao SYN te deixa esperando
- *    o default do sistema operacional (dezenas de segundos) ANTES de o
- *    `timeout` começar a valer para alguma coisa útil.
- *
- *    Como escolher o número: olhe o p99 do gateway e dê alguma folga. Timeout
- *    em cima do p50 é retry desnecessário em metade do tráfego; timeout de 30s
- *    é não ter timeout.
- *
- * 2. O ORÇAMENTO TOTAL tem um teto, e ele não é seu
- *
- *    pior caso = tries x timeout + soma dos backoffs
- *
- *    Neste projeto o nginx tem `fastcgi_read_timeout 60s`
- *    (docker/nginx/default.conf:64). Se o orçamento passar de 60s, o nginx
- *    corta a requisição e devolve um 504 em HTML — o seu Problem Details nunca
- *    é montado, e o cliente recebe uma página de erro do nginx. Ou seja: o
- *    retry que não cabe no tempo de quem te chama não existe; ele só consome
- *    worker de php-fpm e atrasa todo mundo.
- *
- *    Teste isto de propósito: `GATEWAY_TIMEOUT_RATE=1` com
- *    `GATEWAY_TIMEOUT_SLEEP_MS=30000` e 3 tentativas = 90s > 60s.
- *
- * 3. O QUE RETENTAR (o `when`)
- *
- *    O callback é chamado com `(Throwable $e, PendingRequest $request,
- *    ?string $method)` e devolve bool. O terceiro argumento é o verbo HTTP —
- *    existe justamente para você poder dizer "GET eu retento sempre, POST só
- *    se eu souber que não foi processado".
- *
- *    Como o Laravel transforma resposta em exceção para passar por aqui:
- *    resposta malsucedida vira `RequestException` (via
- *    `$response->toException()`), e aí `$e->response->status()` é o status.
- *    Erro de rede vira `Illuminate\Http\Client\ConnectionException`, que NÃO
- *    tem `->response`.
- *
- *      ConnectionException   -> RETENTAR. Mas veja o item 5: timeout é
- *                              diferente de conexão recusada.
- *      503                   -> RETENTAR. É o status que significa "volte
- *                              depois"; respeite o `Retry-After` se vier.
- *      500                   -> AMBÍGUO, e é a decisão mais interessante
- *                              desta fase. O gateway pode ter cobrado e
- *                              explodido ao montar a resposta. Retentar pode
- *                              cobrar duas vezes.
- *      400 / 402 / 404 / 422 -> NUNCA. A resposta não vai mudar. Retentar um
- *                              400 é três vezes o mesmo erro, três vezes mais
- *                              lento, e três linhas de ruído no log.
- *      429                   -> retentar, mas obedecendo o `Retry-After` do
- *                              header, não o seu backoff.
- *
- * 4. BACKOFF: exponencial, com JITTER
- *
- *    `sleepMilliseconds` aceita uma closure `(int $attempt, Throwable $e)`:
- *
- *      fn (int $attempt) => (int) (100 * (2 ** ($attempt - 1)))
- *                            + random_int(0, 100);
- *
- *    Sem backoff, as 3 tentativas batem no gateway que já está mal em poucos
- *    milissegundos. Com backoff FIXO e sem jitter, mil clientes que falharam
- *    no mesmo segundo voltam juntos no mesmo segundo seguinte: você construiu
- *    um DDoS sincronizado contra o seu próprio gateway. O jitter é o que
- *    espalha a volta; é uma linha de código e é a diferença entre o gateway
- *    conseguir levantar ou não.
- *
- *    (Alternativa: `times` como array de atrasos — `retry([100, 500, 2000])`.
- *    Explícito e sem jitter.)
- *
- * 5. O QUE O `throw: false` FAZ, E O QUE ELE NÃO FAZ
- *
- *    Com `throw: false`, esgotadas as tentativas, a última RESPOSTA
- *    malsucedida é devolvida em vez de lançada — é o que mantém o
- *    `$response->status() === 402` do OrderController funcionando.
- *
- *    Mas `ConnectionException` é lançada SEMPRE, com `throw: false` ou não:
- *    não existe resposta para devolver. Então esta função tem dois caminhos de
- *    saída (um `return` e um `throw`), e quem chama precisa lidar com os dois.
- *    Isso não é detalhe de implementação — é a diferença entre
- *    GatewayUnavailable e PaymentUnconfirmed:
- *
- *      ConnectionException por connect timeout / conexão recusada
- *          -> a requisição não chegou   -> GatewayUnavailable
- *      ConnectionException por timeout de leitura (a cobrança foi enviada)
- *          -> não sabemos o resultado   -> PaymentUnconfirmed
- *
- *    O Guzzle não te entrega esses dois casos em classes diferentes: vem tudo
- *    como ConnectionException, e a dica está na mensagem (cURL error 28
- *    "Operation timed out" vs 7 "Failed to connect"). Decidir quanto disso
- *    você quer inspecionar é parte da fase.
- *
- * 6. ONDE LOGAR A TENTATIVA
- *
- *    O `when` é o único lugar que sabe que vai haver outra tentativa. Um
- *    `Log::warning('gateway.retrying', ['attempt' => ..., 'status' => ...])`
- *    ali é o que torna o retry VISÍVEL — senão o cliente espera 4 segundos e
- *    o log não explica por quê. (Na Fase 4 cada tentativa vira um span e isso
- *    aparece desenhado.)
+ *   SÓ RETENTA QUANDO HÁ PROVA DE QUE A COBRANÇA NÃO FOI PROCESSADA.
  *
  * ---------------------------------------------------------------------------
- * E A PERGUNTA CENTRAL DO PROJETO
+ * A TABELA (é o contrato interno da fase)
  *
- * Toda vez que você retenta um POST que pode ter sido processado, você passa a
- * depender da idempotência do OUTRO lado. O `idempotency_key` já vai no corpo
- * da chamada abaixo; o gateway fake IGNORA de propósito.
+ *   o que aconteceu                      retenta?  vira                HTTP
+ *   -----------------------------------  --------  ------------------  ----
+ *   conexão recusada / DNS / connect     SIM       GatewayUnavailable  503
+ *     timeout (não chegou a sair)
+ *   408, 429, 503 (o gateway disse       SIM       GatewayUnavailable  503
+ *     "não processei, volte depois")
+ *   timeout de LEITURA (foi, e não       não       PaymentUnconfirmed  504
+ *     voltou resposta)
+ *   500, 502, 504 (respondeu depois      não       PaymentUnconfirmed  504
+ *     de ter trabalhado — ou não)
+ *   402 recusa                           não       PaymentDeclined     402
+ *     (quem lança é o controller)
+ *   400/404/405 (payload errado)         não       bug NOSSO           500
  *
- * Então, depois de ligar o retry, meça:
+ * Enquanto a Fase 3 não existir, a linha do 500 é a mais frustrante: o retry
+ * resolveria 9 de 10 casos, e a gente não liga porque o décimo é cobrança
+ * dupla. É isso que a idempotência compra — quando o OUTRO lado honrar a
+ * `idempotency_key`, aquelas duas linhas viram SIM e o 504 quase desaparece.
  *
- *     curl -s localhost:8011/_stats | jq .attempts_total
+ * ---------------------------------------------------------------------------
+ * COMO SE DISTINGUE "NÃO CHEGOU" DE "NÃO SEI" (a parte que ninguém faz)
  *
- * 1 requisição do cliente com `GATEWAY_FAIL_RATE=1` e 3 tentativas = 3
- * cobranças tentadas. Com um gateway de verdade, que cobra mesmo, isso é
- * dinheiro. É o motivo de a Fase 3 existir, e é por isso que "retry sem
- * idempotência é perigoso" não é slogan.
+ * O Laravel entrega TODA falha de rede como uma `ConnectionException` só, o
+ * que empurra para o mesmo `catch` dois casos de risco completamente
+ * diferentes. Mas a informação não se perde: a exceção do Guzzle fica no
+ * `getPrevious()`, e o Guzzle 8 tem uma taxonomia precisa —
+ *
+ *   ConnectException         errno 6/7/35: nem conectou      -> não chegou
+ *     + ConnectTimeoutException  estourou o aperto de mão     -> não chegou
+ *   NetworkTimeoutException  errno 28 depois de conectar     -> NÃO SEI
+ *   ResponseTimeoutException resposta começou e parou        -> NÃO SEI
+ *   NetworkException         errno 52/55/56 (send/recv)      -> NÃO SEI
+ *
+ * `ConnectTimeoutException extends ConnectException`, então um `instanceof`
+ * em `ConnectException` cobre os dois casos seguros. E o default, quando não
+ * há `previous` ou a classe é desconhecida, é o PESSIMISTA: não sei. Nunca
+ * afirme "não cobrou" sem prova.
+ *
+ * ---------------------------------------------------------------------------
+ * OS DOIS TIMEOUTS, E O TETO QUE NÃO É SEU
+ *
+ *   connectTimeout (1s)  só o aperto de mão TCP. Host morto, DNS errado,
+ *                        firewall que descarta pacote. Pode ser curto.
+ *   timeout (3s)         o tempo TOTAL até a resposta completa.
+ *
+ * Sem `connectTimeout`, um host que não responde ao SYN te deixa esperando o
+ * default do sistema operacional antes de o `timeout` valer para algo útil.
+ *
+ *   pior caso = tries x timeout + soma dos backoffs = 3x3s + ~0,3s = ~9,3s
+ *
+ * O nginx deste projeto corta em `fastcgi_read_timeout 60s`
+ * (docker/nginx/default.conf:64). Orçamento acima disso = o nginx devolve um
+ * 504 em HTML, o Problem Details nunca é montado e o cliente recebe uma
+ * página de erro. Retry que não cabe no tempo de quem te chama não existe:
+ * só consome worker de php-fpm.
+ *
+ * ---------------------------------------------------------------------------
+ * BACKOFF COM JITTER, E POR QUE O JITTER NÃO É ENFEITE
+ *
+ * Backoff fixo sincroniza: mil clientes que falharam no mesmo segundo voltam
+ * juntos no segundo seguinte, e você construiu um DDoS contra o seu próprio
+ * gateway na hora em que ele está mais fraco. O `random_int` abaixo espalha a
+ * volta. É uma linha, e é a diferença entre o gateway levantar ou não.
+ *
+ * ---------------------------------------------------------------------------
+ * E MEÇA O PREÇO DO RETRY
+ *
+ *     curl -s localhost:8011/_stats | jq '.attempts_total'
+ *
+ * Com `GATEWAY_FAIL_RATE=1 GATEWAY_FAIL_STATUS=503`, 1 requisição do cliente
+ * = 3 cobranças TENTADAS, porque o gateway fake ignora a `idempotency_key` de
+ * propósito. Num gateway de verdade, que cobra mesmo, cada tentativa dessas é
+ * dinheiro. É por isso que "retry sem idempotência é perigoso" não é slogan.
  * ===========================================================================
  */
 class PaymentGateway
 {
+    /**
+     * Status em que o próprio gateway afirma não ter processado a cobrança.
+     * Só estes são seguros para retentar, e é por isso que 500 não está aqui.
+     */
+    private const RETRYABLE_STATUSES = [408, 429, 503];
+
     public function charge(Order $order, string $idempotencyKey): Response
     {
         $url = rtrim((string) config('services.gateway.url'), '/') . '/charge';
 
-        return Http::acceptJson()
-            // FASE 2: ->timeout(), ->connectTimeout() e ->retry() entram aqui.
-            ->withHeaders([
-                // FASE 1: o id sai do Context, não de request(). Duas razões:
-                // o Context tem o valor já VALIDADO pelo middleware, e o retry
-                // desta chamada pode acontecer dentro de um job, onde
-                // request() não existe.
-                // FASE 4: aqui também entra o header `traceparent` (W3C).
-                'X-Request-Id' => (string) Context::get('request_id', '-'),
-            ])
-            ->post($url, [
-                'order_id' => $order->id,
-                'amount_cents' => $order->amount_cents,
-                'currency' => $order->currency,
-                // Vai desde a Fase 0 e ninguém do outro lado respeita. Quando
-                // o retry do item 3 acima estiver ligado, é esta chave que
-                // deveria impedir a cobrança dupla — e é a Fase 3 que faz o
-                // nosso lado honrar a dela.
-                'idempotency_key' => $idempotencyKey,
+        // Contagem EXATA de tentativas. O cliente HTTP do Laravel não conta
+        // para quem chamou, e o `when` do retry não é consultado na última
+        // tentativa de erro de conexão — contar ali daria um número errado.
+        // O middleware de request roda uma vez por chamada FÍSICA.
+        $attempts = 0;
+
+        try {
+            $response = Http::acceptJson()
+                ->timeout((float) config('services.gateway.timeout'))
+                ->connectTimeout((float) config('services.gateway.connect_timeout'))
+                ->withRequestMiddleware(function (RequestInterface $request) use (&$attempts): RequestInterface {
+                    $attempts++;
+
+                    return $request;
+                })
+                ->retry(
+                    times: max(1, (int) config('services.gateway.tries')),
+                    sleepMilliseconds: fn (int $attempt): int => $this->backoffMs($attempt),
+                    // Closure e não arrow function: `$attempts` precisa vir por
+                    // REFERÊNCIA (arrow function captura o valor do momento em
+                    // que é criada, que aqui é sempre zero).
+                    when: function (Throwable $e) use (&$attempts): bool {
+                        return $this->shouldRetry($e, $attempts);
+                    },
+                    // Esgotadas as tentativas, devolve a última RESPOSTA em vez
+                    // de lançar. Não suprime ConnectionException: não existe
+                    // resposta para devolver. Daí o catch abaixo.
+                    throw: false,
+                )
+                ->withHeaders([
+                    // FASE 1: o id sai do Context, não de request(). O Context
+                    // tem o valor já VALIDADO pelo middleware, e o retry desta
+                    // chamada pode acontecer dentro de um job, onde request()
+                    // não existe.
+                    // FASE 4: aqui também entra o header `traceparent` (W3C).
+                    'X-Request-Id' => (string) Context::get('request_id', '-'),
+                ])
+                ->post($url, [
+                    'order_id' => $order->id,
+                    'amount_cents' => $order->amount_cents,
+                    'currency' => $order->currency,
+                    // Vai desde a Fase 0 e ninguém do outro lado respeita.
+                    // É esta chave que DEVERIA impedir a cobrança dupla do
+                    // retry acima — e é a Fase 3 que faz o nosso lado honrar
+                    // a dela.
+                    'idempotency_key' => $idempotencyKey,
+                ]);
+        } catch (ConnectionException $e) {
+            // Não houve resposta. A única pergunta que importa: a requisição
+            // chegou a sair?
+            throw $this->fromConnectionException($e, $order, max($attempts, 1));
+        }
+
+        return $this->ensureUsable($response, $order, max($attempts, 1));
+    }
+
+    /**
+     * A política de retry, num lugar só.
+     *
+     * Chamada com a exceção equivalente da tentativa que acabou de falhar:
+     * resposta malsucedida chega como `RequestException` (o Laravel converte
+     * via `$response->toException()`), falha de rede como `ConnectionException`.
+     *
+     * ARMADILHA DO `when`, e ela faz o log MENTIR se você não souber: o
+     * callback é consultado também na ÚLTIMA tentativa quando a falha é uma
+     * RESPOSTA (o `tap` interno de `PendingRequest::send` o chama antes de
+     * olhar o contador), e NÃO é consultado na última quando a falha é de
+     * conexão (aí quem decide é o `retry()` de helpers.php, que checa o
+     * contador primeiro). Ou seja: "vou retentar" dito aqui não é a mesma
+     * coisa que "vai haver outra tentativa".
+     *
+     * Por isso o `$attempt` entra na decisão. Devolver `false` na última
+     * tentativa não muda comportamento nenhum — com `throw: false` a resposta
+     * é devolvida de qualquer jeito —, muda o LOG: três linhas "retrying"
+     * para duas retentativas é o tipo de erro que só se descobre contando.
+     */
+    private function shouldRetry(Throwable $e, int $attempt): bool
+    {
+        $tries = max(1, (int) config('services.gateway.tries'));
+        $status = $e instanceof RequestException ? $e->response->status() : null;
+
+        // Há PROVA de que a cobrança não foi processada?
+        $seguro = match (true) {
+            $e instanceof ConnectionException => $this->neverArrived($e),
+            $status !== null => in_array($status, self::RETRYABLE_STATUSES, true),
+            default => false,
+        };
+
+        if ($seguro && $attempt < $tries) {
+            // Sem esta linha o cliente espera 9 segundos e o log não explica
+            // por quê. (Na Fase 4 cada tentativa vira um span.)
+            Log::warning('gateway.retrying', [
+                'attempt' => $attempt,
+                'tries' => $tries,
+                'gateway_status' => $status,
+                'error' => $status === null ? $e->getMessage() : null,
             ]);
+
+            return true;
+        }
+
+        // 4xx de negócio (402) não merece linha: a resposta é definitiva e
+        // quem a trata é o controller. Falha de infra, sim — e o MOTIVO de não
+        // insistir é a informação mais importante deste arquivo.
+        if ($status === null || $status >= 500) {
+            Log::warning('gateway.not_retrying', [
+                'attempt' => $attempt,
+                'tries' => $tries,
+                'gateway_status' => $status,
+                'reason' => match (true) {
+                    $seguro => 'tentativas esgotadas',
+                    $status === null => 'a requisicao saiu e nao voltou: pode ter cobrado',
+                    default => 'o gateway respondeu 5xx: pode ter cobrado antes de explodir',
+                },
+            ]);
+        }
+
+        return false;
+    }
+
+    /** Exponencial com jitter: 100+j, 200+j, 400+j milissegundos. */
+    private function backoffMs(int $attempt): int
+    {
+        $base = max(1, (int) config('services.gateway.retry_base_ms'));
+
+        return (int) ($base * (2 ** ($attempt - 1))) + random_int(0, $base);
+    }
+
+    /**
+     * Houve resposta, mas ela pode não ser utilizável pelo negócio.
+     *
+     * Sim, isto lança exceção a partir de um valor de retorno — e é de
+     * propósito: deixar um 500 virar `$response` no controller é como o bug
+     * de hoje acontece (`$response->json('payment_id')` de um corpo que não
+     * tem `payment_id`).
+     */
+    private function ensureUsable(Response $response, Order $order, int $attempts): Response
+    {
+        $status = $response->status();
+
+        if (in_array($status, self::RETRYABLE_STATUSES, true)) {
+            // Retentou e o gateway seguiu dizendo "não processei".
+            throw new GatewayUnavailable(
+                orderId: $order->id,
+                attempts: $attempts,
+                gatewayStatus: $status,
+            );
+        }
+
+        if ($response->serverError()) {
+            // 500/502/504: respondeu, e o que ele fez antes de responder é
+            // desconhecido. Não sabemos se cobrou.
+            throw new PaymentUnconfirmed(
+                orderId: $order->id,
+                attempts: $attempts,
+            );
+        }
+
+        return $response;
+    }
+
+    private function fromConnectionException(
+        ConnectionException $e,
+        Order $order,
+        int $attempts,
+    ): GatewayUnavailable|PaymentUnconfirmed {
+        if ($this->neverArrived($e)) {
+            return new GatewayUnavailable(
+                orderId: $order->id,
+                attempts: $attempts,
+                previous: $e,
+            );
+        }
+
+        return new PaymentUnconfirmed(
+            orderId: $order->id,
+            attempts: $attempts,
+            timeoutSeconds: (int) config('services.gateway.timeout'),
+            previous: $e,
+        );
+    }
+
+    /**
+     * Temos prova de que a cobrança não foi processada?
+     *
+     * Só quando o Guzzle disse que a conexão nem se estabeleceu. Qualquer
+     * outra coisa — inclusive não ter `previous`, que é o caso de um
+     * `Http::fake()` genérico — é tratada como INDETERMINADA. O default
+     * pessimista é a escolha: errar para o lado de "não sei" custa uma
+     * consulta; errar para o lado de "não cobrou" custa uma cobrança dupla.
+     */
+    private function neverArrived(ConnectionException $e): bool
+    {
+        return $e->getPrevious() instanceof GuzzleConnectException;
     }
 }

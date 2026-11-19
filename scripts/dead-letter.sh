@@ -69,7 +69,12 @@ foreach ($rows as $row) {
     printf("  %s\n", $payload['displayName'] ?? '(classe desconhecida)');
     printf("    falhou em   %s\n", $row['failed_at'] ?? '?');
     printf("    uuid        %s\n", $row['uuid'] ?? '?');
-    printf("    tentativas  %s\n", $payload['attempts'] ?? '?');
+    // ARMADILHA: este numero vem do PAYLOAD, e o payload gravado e o da
+    // ultima vez que o job foi devolvido para a fila -- a tentativa que
+    // matou o job nao esta contada ai. Com $tries = 4, aqui aparece 3. O
+    // numero real esta no log, na linha notification.dead_letter, que o
+    // failed() escreve com $this->attempts().
+    printf("    tentativas  %s   (no payload; a ultima nao entra)\n", $payload['attempts'] ?? '?');
     printf("    order_id    %s\n", $unser($context['order_id'] ?? null) ?? '-');
     printf("    request_id  %s\n", $unser($context['request_id'] ?? null) ?? '-');
 

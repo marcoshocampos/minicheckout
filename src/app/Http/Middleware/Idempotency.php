@@ -2,6 +2,7 @@
 
 namespace App\Http\Middleware;
 
+use App\Exceptions\Problem;
 use Closure;
 use Illuminate\Http\Request;
 use Symfony\Component\HttpFoundation\Response;
@@ -53,31 +54,28 @@ class Idempotency
 
         if (blank($key)) {
             // ---------------------------------------------------------------
-            // FASE 2: isto é um Problem Details pela METADE — tem os campos
-            // certos e o Content-Type errado (`application/json`), e é o
-            // único erro da API com esta cara. Um cliente não consegue
-            // escrever UM tratamento de erro para esta API.
+            // FASE 2: antes, isto era um Problem Details pela METADE — campos
+            // certos, `Content-Type: application/json` errado. Era o único
+            // erro da API com essa cara, e por isso um cliente não conseguia
+            // escrever UM tratamento de erro só.
             //
-            // Vira:
+            // Agora é a classe, e ela cuida do resto: o content-type da RFC e
+            // o `request_id` no corpo, como em todos os outros erros.
             //
-            //     return (new Problem(
-            //         status: 400,
-            //         title: 'Idempotency-Key obrigatório',
-            //         type: '/problems/missing-idempotency-key',
-            //         detail: '...',
-            //     ))->toResponse($request);
+            // Repare que isto é RESPOSTA e não exceção: o middleware
+            // interrompe a cadeia devolvendo um response. Dá nos dois jeitos;
+            // exceção seria obrigatória se esta decisão precisasse acontecer
+            // mais fundo, longe de quem monta a resposta.
             //
-            // `App\Exceptions\Problem` já faz o resto (Content-Type correto,
-            // `request_id` no corpo). E note o que muda no CONTRATO: o
-            // `Content-Type` da resposta de erro. Spec no mesmo commit.
+            // Mudança de CONTRATO (o content-type): spec no mesmo commit.
             // ---------------------------------------------------------------
-            return response()->json([
-                'type' => 'about:blank',
-                'title' => 'Idempotency-Key obrigatório',
-                'status' => 400,
-                'detail' => 'Esta rota exige o header Idempotency-Key para que você possa '
+            return (new Problem(
+                status: 400,
+                title: 'Idempotency-Key obrigatório',
+                type: '/problems/missing-idempotency-key',
+                detail: 'Esta rota exige o header Idempotency-Key para que você possa '
                     . 'repetir a requisição com segurança depois de um timeout.',
-            ], 400);
+            ))->toResponse($request);
         }
 
         return $next($request);

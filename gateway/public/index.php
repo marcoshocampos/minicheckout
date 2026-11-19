@@ -180,6 +180,7 @@ $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
 $config = [
     'latency_ms'        => (int) chaos('latency-ms', (float) envInt('GATEWAY_LATENCY_MS', 0)),
     'fail_rate'         => chaos('fail-rate', envFloat('GATEWAY_FAIL_RATE', 0)),
+    'fail_status'       => (int) chaos('fail-status', (float) envInt('GATEWAY_FAIL_STATUS', 500)),
     'decline_rate'      => chaos('decline-rate', envFloat('GATEWAY_DECLINE_RATE', 0)),
     'timeout_rate'      => chaos('timeout-rate', envFloat('GATEWAY_TIMEOUT_RATE', 0)),
     'timeout_sleep_ms'  => (int) chaos('timeout-sleep-ms', (float) envInt('GATEWAY_TIMEOUT_SLEEP_MS', 30000)),
@@ -192,8 +193,9 @@ if ($path === '/' && $method === 'GET') {
         'service'   => 'fake-payment-gateway',
         'endpoints' => ['GET /health', 'POST /charge', 'GET /_stats', 'POST /_reset'],
         'chaos'     => $config,
-        'hint'      => 'Os headers X-Chaos-Fail-Rate, X-Chaos-Latency-Ms, X-Chaos-Timeout-Rate, '
-            . 'X-Chaos-Decline-Rate e X-Chaos-Duplicate-Webhook sobrescrevem por chamada.',
+        'hint'      => 'Os headers X-Chaos-Fail-Rate, X-Chaos-Fail-Status, X-Chaos-Latency-Ms, '
+            . 'X-Chaos-Timeout-Rate, X-Chaos-Decline-Rate e X-Chaos-Duplicate-Webhook '
+            . 'sobrescrevem por chamada.',
     ]);
 }
 
@@ -248,11 +250,23 @@ if ($path === '/charge') {
         respond(504, ['error' => 'gateway_timeout', 'message' => 'demorei de proposito']);
     }
 
-    // 2) 500: erro inesperado e transitorio. Pode retentar.
+    // 2) Falha do lado do gateway. O STATUS e configuravel de proposito,
+    //    porque os dois casos exigem decisoes OPOSTAS do cliente (Fase 2):
+    //
+    //      500  "explodi". Pode ter cobrado antes de explodir -> o cliente
+    //           NAO pode retentar: e o caso INDETERMINADO.
+    //      503  "estou fora, nao processei nada" -> retentar e seguro, e e
+    //           o unico jeito de VER o retry acontecendo no /_stats.
+    //
+    //    GATEWAY_FAIL_STATUS=503 + GATEWAY_FAIL_RATE=1 e o cenario que mostra
+    //    1 requisicao do cliente = N cobrancas tentadas.
     if (chance($config['fail_rate'])) {
+        $status = $config['fail_status'];
         countAttempt($orderId, 'failed');
-        logLine('charge.exploded', ['order_id' => $orderId]);
-        respond(500, ['error' => 'internal_error', 'message' => 'explodi de proposito']);
+        logLine('charge.exploded', ['order_id' => $orderId, 'status' => $status]);
+        respond($status, $status === 503
+            ? ['error' => 'unavailable', 'message' => 'estou fora de proposito, nao processei nada']
+            : ['error' => 'internal_error', 'message' => 'explodi de proposito']);
     }
 
     $paymentId = 'pay_' . bin2hex(random_bytes(8));

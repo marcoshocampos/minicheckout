@@ -11,6 +11,7 @@ use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Facades\Context;
 use Illuminate\Support\Facades\Log;
 use RuntimeException;
+use Throwable;
 
 /**
  * "Envia a notificação" do pedido pago. Não envia nada de verdade: só grava
@@ -154,12 +155,59 @@ class SendOrderNotification implements ShouldQueue
     use Queueable;
     use SerializesModels;
 
-    // FASE 2 — aqui entram `$tries` e `backoff()`. Sem eles, o worker usa o
-    // `--tries=1` do docker-compose: uma falha e o job vai direto para a dead
-    // letter queue, sem nenhuma segunda chance.
+    /**
+     * FASE 2 — quatro tentativas.
+     *
+     * Esta linha é o que faz o worker IGNORAR o `--tries=1` do
+     * docker-compose: `Worker::markJobAsFailedIfAlreadyExceedsMaxAttempts` lê
+     * `$job->maxTries()` primeiro e só cai no `--tries` da linha de comando
+     * quando o job não diz nada.
+     *
+     * ARMADILHA: `$tries` e `backoff()` são serializados no PAYLOAD, no
+     * momento do DISPATCH. Job que já está na fila carrega os valores
+     * ANTIGOS. Mudou o número, reiniciou o worker e nada mudou? Os jobs em
+     * voo são os de antes — esvazie a fila ou despache de novo.
+     */
+    public int $tries = 4;
 
     public function __construct(public Order $order)
     {
+    }
+
+    /**
+     * FASE 2 — os intervalos entre as tentativas, em segundos: 2, 8, 8.
+     *
+     * São dois valores para quatro tentativas (três intervalos) porque o
+     * ÚLTIMO VALOR SE REPETE. O detalhe não está óbvio na documentação: o
+     * array é serializado como "2,8" e o worker faz
+     * `$backoff[$attempts - 1] ?? last($backoff)`
+     * (`Illuminate\Queue\Worker::calculateBackoff`). Com `[2, 8]` e
+     * `$tries = 4`, os intervalos são 2, 8 e 8.
+     *
+     * Por que não zero: se a causa da falha dura mais que microssegundos — e
+     * quase toda causa real dura mais —, as quatro tentativas em sequência
+     * são quatro falhas no mesmo estado, gastas em um segundo. Isso não é
+     * retentar: é desistir quatro vezes.
+     *
+     * Jitter aqui importa menos que no retry do gateway (a fila já espalha),
+     * mas mil jobs que falharam pelo mesmo banco fora voltam no mesmo
+     * segundo. `return [2 + random_int(0, 2), 8 + random_int(0, 4)];`
+     * resolveria — ao custo de o teste observável ficar menos previsível.
+     *
+     * A alternativa é `retryUntil()`, que dá um PRAZO em vez de uma
+     * contagem:
+     *
+     *     public function retryUntil(): \DateTime { return now()->addMinutes(10); }
+     *
+     * Prazo é sobre o VALOR do efeito (avisar o cliente 4 horas depois pode
+     * ser pior que não avisar); contagem é sobre o CUSTO da tentativa. Se os
+     * dois existirem, o prazo ganha.
+     *
+     * @return array<int, int>
+     */
+    public function backoff(): array
+    {
+        return [2, 8];
     }
 
     public function handle(): void
@@ -214,8 +262,47 @@ class SendOrderNotification implements ShouldQueue
         ]);
     }
 
-    // FASE 2 — e aqui entra o `failed(?Throwable $e)`. Enquanto ele não
-    // existir, a morte do job é silenciosa do ponto de vista do NEGÓCIO: o
-    // framework grava em `failed_jobs`, mas nada no log do worker diz "este
-    // pedido não foi notificado e não vai ser".
+    /**
+     * FASE 2 — a última palavra do job.
+     *
+     * Roda UMA vez, depois da última tentativa (ou na hora, se a exceção
+     * estiver no `dontRetry` de bootstrap/app.php). O framework grava a linha
+     * em `failed_jobs` com payload completo, exceção e horário; o que ele NÃO
+     * faz é dizer no log do worker, em linguagem de negócio, que este pedido
+     * não foi notificado e não vai ser. Sem este método, a morte do job é
+     * silenciosa para quem lê o log.
+     *
+     * Duas coisas que valem saber:
+     *
+     * a) O Context da Fase 1 JÁ está hidratado aqui. O worker dispara
+     *    `JobProcessing` (que re-hidrata o Context) ANTES de checar as
+     *    tentativas, então esta linha sai com o `request_id` da requisição
+     *    HTTP que criou o pedido — horas antes, em outro processo. É o fecho
+     *    da Fase 1 com a Fase 2: `./scripts/dead-letter.sh` tira esse mesmo
+     *    id de dentro do payload e te devolve o `follow-request.sh` pronto.
+     *
+     * b) Faça o MÍNIMO. Se o `failed()` também falhar, não há terceira rede —
+     *    e o que estava para ser gravado na dead letter se perde. Por isso
+     *    aqui só tem log: nada de novo UPDATE, nada de HTTP, nada de
+     *    re-despachar (re-despachar daqui é um loop infinito com passos
+     *    extras).
+     *
+     * E a pergunta que o roteiro faz, e que nenhum código responde: QUEM olha
+     * essa tabela, e QUANDO? Job que falha 4 vezes e ninguém olha é
+     * exatamente igual a job perdido, só com mais disco usado. Na Fase 5 isto
+     * vira métrica e alerta ("tamanho da DLQ > 0 por 5 minutos").
+     */
+    public function failed(?Throwable $e): void
+    {
+        Log::error('notification.dead_letter', [
+            'attempts' => $this->attempts(),
+            // A CLASSE antes da mensagem: é por ela que se agrupa no gráfico
+            // e é ela que diz se foi erro nosso ou do mundo.
+            'exception' => $e === null ? null : $e::class,
+            'reason' => $e?->getMessage(),
+            // O efeito que não aconteceu, dito em linguagem de negócio. É a
+            // linha que um humano procura, e não "Job failed".
+            'effect_lost' => 'o cliente nao foi notificado do pedido pago',
+        ]);
+    }
 }

@@ -3,6 +3,9 @@
 namespace App\Http\Controllers;
 
 use App\Enums\OrderStatus;
+use App\Exceptions\GatewayUnavailable;
+use App\Exceptions\PaymentDeclined;
+use App\Exceptions\PaymentUnconfirmed;
 use App\Http\Requests\StoreOrderRequest;
 use App\Jobs\SendOrderNotification;
 use App\Models\Order;
@@ -41,35 +44,51 @@ class OrderController extends Controller
         ]);
 
         // -------------------------------------------------------------------
-        // FASE 2: esta chamada tem DOIS caminhos de saída, não um.
+        // FASE 2 — o `charge()` já retentou e já classificou (ver
+        // PaymentGateway). O que sobra para o controller é a única coisa que
+        // o serviço HTTP não pode saber: o que o ESTADO DO PEDIDO vira em
+        // cada caso.
         //
-        // Com o retry ligado (ver PaymentGateway), ela devolve a resposta —
-        // inclusive a malsucedida, por causa do `throw: false` — ou LANÇA
-        // `Illuminate\Http\Client\ConnectionException`, que o `throw: false`
-        // não suprime: não há resposta para devolver.
+        // E a distinção que quase todo sistema perde está exatamente aqui:
         //
-        // Então falta um try/catch aqui, e a decisão de qual exceção de
-        // domínio cada caso vira:
+        //   failed   temos prova de que não cobrou   -> repetir é seguro
+        //   unknown  pode ter cobrado                -> NÃO repita; consulte
         //
-        //     try {
-        //         $response = $this->gateway->charge($order, $idempotencyKey);
-        //     } catch (ConnectionException $e) {
-        //         $order->update(['status' => OrderStatus::Failed]);
-        //         // TODO: connect timeout / conexão recusada -> a cobrança
-        //         //       NÃO aconteceu           -> GatewayUnavailable
-        //         // TODO: timeout de leitura      -> pode ter acontecido
-        //         //                               -> PaymentUnconfirmed
-        //         throw ...;
-        //     }
+        // Guardar os dois como `failed` é o atalho que transforma um
+        // incidente de disponibilidade em um incidente financeiro: amanhã
+        // alguém escreve um script que "reprocessa os failed".
         //
-        // Hoje ninguém captura: o pedido fica `pending` para sempre (nem
-        // `failed`, porque a linha do update está depois) e o cliente recebe
-        // um 500 com o stack trace inteiro.
-        //
-        // Veja acontecer: GATEWAY_TIMEOUT_RATE=1 no .env da raiz e
-        // `docker compose up -d gateway`.
+        // Nota de concorrência: estes `update()` só são seguros porque não há
+        // transação aberta aqui. Dentro de uma transação, a exceção lançada
+        // em seguida desfaria a gravação do status, e o pedido ficaria
+        // `pending` — exatamente o bug que esta fase remove.
         // -------------------------------------------------------------------
-        $response = $this->gateway->charge($order, $idempotencyKey);
+        try {
+            $response = $this->gateway->charge($order, $idempotencyKey);
+        } catch (GatewayUnavailable $e) {
+            $order->update(['status' => OrderStatus::Failed]);
+
+            // warning, e não error: o cliente recebeu um 503 limpo, nada foi
+            // cobrado e repetir resolve. A gravidade do log acompanha a do
+            // incidente — ver `level()` em bootstrap/app.php.
+            Log::warning('order.payment_failed', [
+                'attempts' => $e->attempts,
+                'gateway_status' => $e->gatewayStatus,
+            ]);
+
+            throw $e;
+        } catch (PaymentUnconfirmed $e) {
+            $order->update(['status' => OrderStatus::Unknown]);
+
+            // critical: pode haver dinheiro cobrado sem pedido pago. É o tipo
+            // de linha que merece alerta na Fase 5, e é o que a reconciliação
+            // da Fase 3 vai consumir.
+            Log::critical('order.payment_unconfirmed', [
+                'attempts' => $e->attempts,
+            ]);
+
+            throw $e;
+        }
 
         // --- recusa: erro ESPERADO -------------------------------------
         if ($response->status() === 402) {
@@ -83,25 +102,25 @@ class OrderController extends Controller
                 'decline_code' => $response->json('decline_code'),
             ]);
 
-            // FASE 2: 201 com status `declined` ou 402 para o cliente? A regra
-            // é sua, mas tem que ser consciente: o PEDIDO foi criado, o
-            // PAGAMENTO foi negado. E recusa não vira alerta de plantão.
+            // FASE 2 — DECISÃO TOMADA: 402, e não 201 com `status: declined`.
             //
-            // Se a escolha for 402, a linha abaixo vira
+            // O 201 se defende (o PEDIDO foi criado; o pagamento é um estado
+            // do recurso), mas ele premia o cliente preguiçoso com a resposta
+            // errada: quem olha só o código HTTP conclui que deu certo. O 402
+            // acerta de graça para quem trata 4xx como erro, e o pedido
+            // continua consultável em `GET /orders/{id}`.
             //
-            //     throw new PaymentDeclined(
-            //         orderId: $order->id,
-            //         declineCode: $response->json('decline_code'),
-            //         paymentId: $response->json('payment_id'),
-            //     );
+            // O preço: é mudança de CONTRATO. Spec no mesmo commit.
             //
-            // e `App\Exceptions\PaymentDeclined` já sabe se apresentar em
-            // Problem Details. Note que lançar exceção DEPOIS do `update()`
-            // funciona porque não há transação aberta aqui — se um dia
-            // houver, a exceção desfaria a gravação do `declined`. Esse é o
-            // tipo de detalhe que faz "usar exceção para fluxo esperado" ser
-            // uma escolha, não um automatismo.
-            return $this->present($order, 201);
+            // E repare que isto é erro esperado usando o mecanismo de
+            // exceção. Funciona, mas tem custo: `dontReport` em
+            // bootstrap/app.php é obrigatório, senão 5% de recusa num dia de
+            // promoção dispara o alerta de taxa de erro da Fase 5.
+            throw new PaymentDeclined(
+                orderId: $order->id,
+                declineCode: $response->json('decline_code'),
+                paymentId: $response->json('payment_id'),
+            );
         }
 
         // --- aprovado ---------------------------------------------------
@@ -125,32 +144,27 @@ class OrderController extends Controller
             return $this->present($order, 201);
         }
 
-        // --- 5xx: erro INESPERADO ---------------------------------------
+        // --- o que não deveria existir: BUG NOSSO -----------------------
+        //
+        // O PaymentGateway já converteu 5xx e 408/429/503 em exceção de
+        // domínio, e o 402 foi tratado acima. Chegar aqui é o gateway dizendo
+        // 400/404/405: payload errado, rota errada, contrato quebrado. Não é
+        // falha de infraestrutura e não é recusa — é código nosso errado.
+        //
+        // Por isso é RuntimeException crua, de propósito: ela DEVE ser
+        // reportada com stack trace (é o que a gente precisa para corrigir) e
+        // o cliente DEVE receber um 500 genérico com o `request_id`, sem
+        // detalhe interno. Quem faz essa tradução é o `respond()` de
+        // bootstrap/app.php — é a terceira categoria da fase, a que não tem
+        // classe de domínio porque não tem nada a dizer ao cliente.
         $order->update(['status' => OrderStatus::Failed]);
 
-        Log::error('order.payment_failed', [
+        Log::error('order.gateway_rejected_request', [
             'gateway_status' => $response->status(),
             'gateway_body' => $response->json(),
         ]);
 
-        // FASE 2: isto vira
-        //
-        //     throw new GatewayUnavailable(
-        //         orderId: $order->id,
-        //         attempts: config('services.gateway.tries'),
-        //         gatewayStatus: $response->status(),
-        //     );
-        //
-        // ...mas só depois de o PaymentGateway ter retentado. E repare que o
-        // `attempts` acima é um palpite: o cliente HTTP do Laravel não conta
-        // as tentativas para quem chamou. Se esse número tem que ser exato,
-        // quem conta é o `when` do retry — mais um motivo para logar lá.
-        //
-        // Hoje é um 500 cru do Laravel: `message`, `exception`, `file`,
-        // `line` e o trace inteiro no corpo da resposta, por causa do
-        // APP_DEBUG=true. É exatamente o que o cliente não deveria ver, e é o
-        // que esta fase conserta.
-        throw new RuntimeException("gateway respondeu {$response->status()}");
+        throw new RuntimeException("gateway respondeu {$response->status()}: requisicao invalida");
     }
 
     public function show(Order $order): JsonResponse

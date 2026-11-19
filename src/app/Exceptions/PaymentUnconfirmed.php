@@ -46,25 +46,36 @@ class PaymentUnconfirmed extends RuntimeException implements ProvidesProblem
     public function problem(): Problem
     {
         // ------------------------------------------------------------------
-        // FASE 2 — DECISÃO SUA:
+        // FASE 2 — DECISÃO TOMADA: 504, SEM `Retry-After`.
         //
-        // 504 (Gateway Timeout) descreve exatamente a causa e é o palpite
-        // óbvio. 502 é mais genérico. 409 (Conflict) é escolha menos comum e
-        // defensável: "não posso concluir sem saber em que estado isto está".
+        // 504 (Gateway Timeout) descreve a causa e é o palpite óbvio; 502 é
+        // mais genérico; 409 (Conflict) seria defensável ("não posso concluir
+        // sem saber em que estado isto está"), mas 409 convida o cliente a
+        // resolver o conflito, e aqui não há nada que ele possa resolver.
         //
-        // O que NÃO pode: mandar `Retry-After`. Ele é um convite a repetir, e
-        // repetir é justamente o que pode cobrar duas vezes enquanto a
-        // idempotência não existir (Fase 3). Quando a Fase 3 estiver pronta e
-        // o replay da MESMA Idempotency-Key for garantido, este `detail` muda
-        // — e a spec muda junto, no mesmo commit.
+        // O que NÃO pode, em nenhuma das três: mandar `Retry-After`. Ele é um
+        // convite a repetir, e repetir é justamente o que pode cobrar duas
+        // vezes enquanto a idempotência não existir. O `instance` abaixo é o
+        // oposto do Retry-After: em vez de "tente de novo", ele entrega a URI
+        // de onde o cliente DESCOBRE o que aconteceu.
+        //
+        // Quando a Fase 3 estiver pronta e o replay da MESMA Idempotency-Key
+        // for garantido, este `detail` muda e o `Retry-After` passa a poder
+        // existir — e a spec muda junto, no mesmo commit.
         // ------------------------------------------------------------------
         return (new Problem(
             status: 504,
             title: 'Pagamento sem confirmação',
             type: '/problems/payment-unconfirmed',
-            detail: 'Enviamos a cobrança e o gateway não respondeu no tempo '
-                . 'limite. NÃO sabemos se o pagamento foi feito. Consulte '
-                . 'GET /orders/{id} antes de tentar pagar de novo.',
+            // O texto serve para os DOIS caminhos que chegam aqui: o gateway
+            // que não respondeu e o que respondeu 5xx depois de já ter
+            // trabalhado. Dizer "não respondeu no tempo limite" seria mentira
+            // no segundo caso — e detalhe de erro que mente custa chamado.
+            detail: 'Enviamos a cobrança e não obtivemos uma resposta '
+                . 'conclusiva do gateway. NÃO sabemos se o pagamento foi '
+                . 'feito; o pedido ficou com status `unknown`. Consulte o '
+                . 'pedido antes de tentar pagar de novo.',
+            instance: "/orders/{$this->orderId}",
         ))
             ->with('order_id', $this->orderId);
     }
