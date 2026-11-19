@@ -93,7 +93,11 @@ services:
       # merge do anchor + a única diferença deste container: quem ele é no log.
       <<: *app-env
       LOG_SOURCE: worker
-    # Fase 2 vai mexer em tries/backoff; aqui ainda é o default cru, de propósito.
+    # `--tries=1` é o default EXPLÍCITO: job que não declara `$tries` não
+    # insiste. Quem declara ganha — o worker lê `$job->maxTries()` primeiro e
+    # só cai no `--tries` da linha de comando quando o job não disse nada
+    # (Illuminate\Queue\Worker::markJobAsFailedIfAlreadyExceedsMaxAttempts).
+    # Ou seja: a Fase 2 mexe em app/Jobs/, não nesta linha.
     command: ["php", "artisan", "queue:work", "--verbose", "--tries=1"]
     depends_on:
       db:

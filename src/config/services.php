@@ -37,7 +37,33 @@ return [
 
     // Gateway de pagamento fake (serviço `gateway` do docker-compose).
     'gateway' => [
+        // Topologia: vem do compose, não de src/.env.
         'url' => env('GATEWAY_URL', 'http://gateway:8080'),
+
+        // -------------------------------------------------------------------
+        // FASE 2 — as alavancas de timeout e retry do NOSSO cliente HTTP.
+        //
+        // Cuidado com os nomes, porque são dois mundos parecidos:
+        //   GATEWAY_HTTP_*         -> como o APP chama o gateway (aqui,
+        //                             src/.env)
+        //   GATEWAY_TIMEOUT_RATE,
+        //   GATEWAY_FAIL_RATE, ... -> o CAOS que o gateway fake aplica em si
+        //                             mesmo (.env da raiz, injetado pelo
+        //                             compose só no container `gateway`)
+        //
+        // Por que em config e não hard-coded no PaymentGateway: o teste
+        // observável da fase precisa mexer no timeout e no número de
+        // tentativas sem editar código, e porque timeout é configuração de
+        // ambiente — o que serve em dev não serve em produção.
+        //
+        // Os valores abaixo são um ponto de partida, não uma recomendação:
+        // 3s de timeout com 3 tentativas e backoff dá um pior caso de ~10s,
+        // que cabe no `fastcgi_read_timeout 60s` do nginx com folga.
+        // -------------------------------------------------------------------
+        'timeout' => (float) env('GATEWAY_HTTP_TIMEOUT', 3),
+        'connect_timeout' => (float) env('GATEWAY_HTTP_CONNECT_TIMEOUT', 1),
+        'tries' => (int) env('GATEWAY_HTTP_TRIES', 3),
+        'retry_base_ms' => (int) env('GATEWAY_HTTP_RETRY_BASE_MS', 100),
     ],
 
 ];

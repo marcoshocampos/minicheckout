@@ -52,9 +52,25 @@ class Idempotency
         $key = $request->header('Idempotency-Key');
 
         if (blank($key)) {
-            // FASE 2: isto vira Problem Details (RFC 9457) de verdade, com
-            // Content-Type: application/problem+json e um `type` que aponta
-            // para a documentação do erro.
+            // ---------------------------------------------------------------
+            // FASE 2: isto é um Problem Details pela METADE — tem os campos
+            // certos e o Content-Type errado (`application/json`), e é o
+            // único erro da API com esta cara. Um cliente não consegue
+            // escrever UM tratamento de erro para esta API.
+            //
+            // Vira:
+            //
+            //     return (new Problem(
+            //         status: 400,
+            //         title: 'Idempotency-Key obrigatório',
+            //         type: '/problems/missing-idempotency-key',
+            //         detail: '...',
+            //     ))->toResponse($request);
+            //
+            // `App\Exceptions\Problem` já faz o resto (Content-Type correto,
+            // `request_id` no corpo). E note o que muda no CONTRATO: o
+            // `Content-Type` da resposta de erro. Spec no mesmo commit.
+            // ---------------------------------------------------------------
             return response()->json([
                 'type' => 'about:blank',
                 'title' => 'Idempotency-Key obrigatório',

@@ -40,10 +40,35 @@ class OrderController extends Controller
             'idempotency_key' => $idempotencyKey,
         ]);
 
-        // FASE 2: esta chamada pode lançar ConnectionException (timeout ou
-        // conexão recusada). Hoje ninguém captura: o pedido fica `pending`
-        // para sempre e o cliente recebe um 500 sem explicação.
-        // Ligue GATEWAY_LATENCY_MS=35000 e veja esse caso acontecer.
+        // -------------------------------------------------------------------
+        // FASE 2: esta chamada tem DOIS caminhos de saída, não um.
+        //
+        // Com o retry ligado (ver PaymentGateway), ela devolve a resposta —
+        // inclusive a malsucedida, por causa do `throw: false` — ou LANÇA
+        // `Illuminate\Http\Client\ConnectionException`, que o `throw: false`
+        // não suprime: não há resposta para devolver.
+        //
+        // Então falta um try/catch aqui, e a decisão de qual exceção de
+        // domínio cada caso vira:
+        //
+        //     try {
+        //         $response = $this->gateway->charge($order, $idempotencyKey);
+        //     } catch (ConnectionException $e) {
+        //         $order->update(['status' => OrderStatus::Failed]);
+        //         // TODO: connect timeout / conexão recusada -> a cobrança
+        //         //       NÃO aconteceu           -> GatewayUnavailable
+        //         // TODO: timeout de leitura      -> pode ter acontecido
+        //         //                               -> PaymentUnconfirmed
+        //         throw ...;
+        //     }
+        //
+        // Hoje ninguém captura: o pedido fica `pending` para sempre (nem
+        // `failed`, porque a linha do update está depois) e o cliente recebe
+        // um 500 com o stack trace inteiro.
+        //
+        // Veja acontecer: GATEWAY_TIMEOUT_RATE=1 no .env da raiz e
+        // `docker compose up -d gateway`.
+        // -------------------------------------------------------------------
         $response = $this->gateway->charge($order, $idempotencyKey);
 
         // --- recusa: erro ESPERADO -------------------------------------
@@ -61,6 +86,21 @@ class OrderController extends Controller
             // FASE 2: 201 com status `declined` ou 402 para o cliente? A regra
             // é sua, mas tem que ser consciente: o PEDIDO foi criado, o
             // PAGAMENTO foi negado. E recusa não vira alerta de plantão.
+            //
+            // Se a escolha for 402, a linha abaixo vira
+            //
+            //     throw new PaymentDeclined(
+            //         orderId: $order->id,
+            //         declineCode: $response->json('decline_code'),
+            //         paymentId: $response->json('payment_id'),
+            //     );
+            //
+            // e `App\Exceptions\PaymentDeclined` já sabe se apresentar em
+            // Problem Details. Note que lançar exceção DEPOIS do `update()`
+            // funciona porque não há transação aberta aqui — se um dia
+            // houver, a exceção desfaria a gravação do `declined`. Esse é o
+            // tipo de detalhe que faz "usar exceção para fluxo esperado" ser
+            // uma escolha, não um automatismo.
             return $this->present($order, 201);
         }
 
@@ -93,10 +133,23 @@ class OrderController extends Controller
             'gateway_body' => $response->json(),
         ]);
 
-        // FASE 2: isto vira uma exceção de domínio (ex. GatewayUnavailable),
-        // renderizada como Problem Details e com retry ANTES de desistir.
-        // Hoje é um 500 cru do Laravel, que é exatamente o que o cliente não
-        // deveria ver.
+        // FASE 2: isto vira
+        //
+        //     throw new GatewayUnavailable(
+        //         orderId: $order->id,
+        //         attempts: config('services.gateway.tries'),
+        //         gatewayStatus: $response->status(),
+        //     );
+        //
+        // ...mas só depois de o PaymentGateway ter retentado. E repare que o
+        // `attempts` acima é um palpite: o cliente HTTP do Laravel não conta
+        // as tentativas para quem chamou. Se esse número tem que ser exato,
+        // quem conta é o `when` do retry — mais um motivo para logar lá.
+        //
+        // Hoje é um 500 cru do Laravel: `message`, `exception`, `file`,
+        // `line` e o trace inteiro no corpo da resposta, por causa do
+        // APP_DEBUG=true. É exatamente o que o cliente não deveria ver, e é o
+        // que esta fase conserta.
         throw new RuntimeException("gateway respondeu {$response->status()}");
     }
 
