@@ -8,6 +8,7 @@ use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
+use Illuminate\Support\Facades\Context;
 use Illuminate\Support\Facades\Log;
 
 /**
@@ -57,12 +58,22 @@ class SendOrderNotification implements ShouldQueue
 
     public function handle(): void
     {
-        // FASE 1: este log tem que sair com o MESMO request_id da requisição
-        // que criou o pedido, mesmo rodando em outro processo. É o teste que
-        // fecha a fase: um request_id, todos os logs — HTTP e job.
+        // O Context chega hidratado da requisição que despachou o job, mas um
+        // job também pode ser despachado por um comando artisan ou re-tentado
+        // sem requisição nenhuma. Reafirmar o order_id aqui é barato e faz a
+        // linha do worker nunca sair sem ele.
+        Context::add('order_id', $this->order->id);
+
+        // FASE 1: esta linha sai com o MESMO request_id da requisição que
+        // criou o pedido, em OUTRO processo, sem ninguém ter passado nada.
+        //
+        // O e-mail do cliente saiu daqui de propósito: log é dado que deixa o
+        // processo e vai para um índice de busca, e PII em índice de busca é
+        // problema que você não quer descobrir depois. O `order_id` já
+        // identifica o pedido e o e-mail está no banco. Se algum dia um dado
+        // precisar atravessar para o job SEM aparecer no log, o mecanismo é
+        // `Context::addHidden()`.
         Log::info('notification.sending', [
-            'order_id' => $this->order->id,
-            'email' => $this->order->customer_email,
             'attempt' => $this->attempts(),
         ]);
 
@@ -72,7 +83,6 @@ class SendOrderNotification implements ShouldQueue
         $this->order->update(['notified_at' => now()]);
 
         Log::info('notification.sent', [
-            'order_id' => $this->order->id,
             'notified_at' => $this->order->notified_at,
         ]);
     }

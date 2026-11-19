@@ -15,7 +15,7 @@ openapi: 3.1.0
 
 info:
   title: Mini Checkout API
-  version: 0.2.0
+  version: 0.3.0
   summary: Criação de pedidos com cobrança, notificação assíncrona e webhook.
   description: |
     API de um projeto de **estudo**. O domínio é propositalmente minúsculo: a
@@ -23,12 +23,12 @@ info:
     fila, webhook), que é onde observabilidade, rastreabilidade, tratamento de
     erros e idempotência importam.
 
-    ### Estado atual: Fase 1 em andamento
+    ### Estado atual: Fase 1 concluída
 
     | Fase | Assunto | Estado |
     |---|---|---|
     | 0 | Setup, domínio mínimo, gateway fake | concluída |
-    | 1 | Logs estruturados e correlação | em andamento |
+    | 1 | Logs estruturados e correlação | concluída |
     | 2 | Tratamento de erros, Problem Details, retry | pendente |
     | 3 | Idempotência (requisição, webhook e job) | pendente |
     | 4 | Tracing distribuído | pendente |
@@ -38,6 +38,14 @@ info:
     Problem Details** (RFC 9457) e **o `Idempotency-Key` ainda não deduplica
     nada** — hoje ele é só obrigatório. As duas coisas estão marcadas nos
     endpoints.
+
+    ### Correlação
+
+    Toda resposta traz o header **`X-Request-Id`**, inclusive em erro. Guarde
+    esse valor: é com ele que se acha, de uma vez, o log da borda (nginx), o
+    da aplicação, o do gateway de pagamento e o do job assíncrono que a
+    requisição disparou. Se você mandar o header na requisição, ele é
+    respeitado.
   contact:
     name: Repositório
     url: https://github.com/marcoshocampos/minicheckout
@@ -78,7 +86,6 @@ paths:
 
         #### O que ainda falta no contrato
 
-        - `X-Request-Id` no response: a Fase 1 vai devolvê-lo (hoje ausente)
         - Erros em `application/problem+json`: Fase 2
         - `409` e `422` por chave repetida, e replay da resposta salva: Fase 3
       parameters:
@@ -103,6 +110,9 @@ paths:
             Pedido criado. Atenção: **também é 201 quando o pagamento é
             recusado** — o pedido foi criado, o pagamento é que foi negado.
             Olhe o campo `status`, não só o código HTTP.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestIdResponse'
           content:
             application/json:
               schema:
@@ -161,6 +171,9 @@ paths:
       responses:
         '200':
           description: O pedido.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestIdResponse'
           content:
             application/json:
               schema:
@@ -169,6 +182,9 @@ paths:
           description: |
             Pedido inexistente. O corpo vem do handler padrão do Laravel e
             **não** é Problem Details ainda (Fase 2).
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestIdResponse'
           content:
             application/json:
               schema:
@@ -228,6 +244,9 @@ paths:
       responses:
         '200':
           description: Evento processado.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestIdResponse'
           content:
             application/json:
               schema:
@@ -238,6 +257,9 @@ paths:
                     const: ok
         '202':
           description: Pedido não encontrado; o evento foi descartado.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestIdResponse'
           content:
             application/json:
               schema:
@@ -261,12 +283,33 @@ paths:
       responses:
         '200':
           description: Aplicação saudável.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestIdResponse'
           content:
             text/html:
               schema:
                 type: string
 
 components:
+  headers:
+    XRequestIdResponse:
+      description: |
+        O id de correlação desta requisição, devolvido pelo middleware
+        `App\Http\Middleware\RequestId`.
+
+        Vem em **toda** resposta, inclusive em 4xx e 5xx — é justamente no erro
+        que o cliente precisa dele: é o que ele tem para abrir um chamado
+        ("deu erro, o id é X") e alguém conseguir achar a requisição inteira no
+        log, incluindo o job assíncrono que ela disparou.
+
+        É o mesmo valor que você enviou, se enviou um válido; senão, um id novo
+        (ULID, ordenável por tempo).
+      required: true
+      schema:
+        type: string
+        examples: ['01KA7Z4R8P3Q1T6V9W2X5Y8Z0B']
+
   parameters:
     IdempotencyKey:
       name: Idempotency-Key
@@ -291,10 +334,19 @@ components:
       description: |
         Id de correlação. Se você mandar, ele é respeitado e aparece no log de
         acesso do nginx, nos logs da aplicação, no gateway e no job da fila. Se
-        não mandar, o nginx gera um.
+        não mandar, um é gerado.
 
         É o que permite dizer "deu erro, o id é X" e alguém achar a requisição
         inteira — inclusive o que aconteceu de forma assíncrona depois dela.
+
+        **O valor volta sempre no response**: veja o header `X-Request-Id` em
+        cada resposta desta spec.
+
+        O id recebido é **validado** antes de ser usado, porque ele vai parar
+        num índice de log — um valor com quebra de linha dentro injetaria uma
+        linha de log falsa. Um valor que não passa na validação é descartado e
+        substituído por um gerado: ou seja, o que você mandou pode não ser o
+        que volta. O `maxLength` abaixo é o limite que o middleware aplica.
       schema:
         type: string
         maxLength: 200
@@ -450,6 +502,9 @@ components:
       description: |
         O header `Idempotency-Key` não foi enviado. Produzido pelo middleware
         `App\Http\Middleware\Idempotency`.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestIdResponse'
       content:
         application/json:
           schema:
@@ -466,6 +521,9 @@ components:
       description: |
         Payload inválido. Erro **esperado**: responde ao cliente e não deveria
         gerar alerta nem acordar ninguém (Fase 2, `dontReport`).
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestIdResponse'
       content:
         application/json:
           schema:
@@ -490,6 +548,9 @@ components:
 
         Reproduza: `GATEWAY_FAIL_RATE=1` no `.env` da raiz e
         `docker compose up -d gateway`.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestIdResponse'
       content:
         application/json:
           schema:

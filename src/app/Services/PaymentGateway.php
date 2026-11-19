@@ -4,6 +4,7 @@ namespace App\Services;
 
 use App\Models\Order;
 use Illuminate\Http\Client\Response;
+use Illuminate\Support\Facades\Context;
 use Illuminate\Support\Facades\Http;
 
 /**
@@ -46,10 +47,12 @@ class PaymentGateway
 
         return Http::acceptJson()
             ->withHeaders([
-                // FASE 1: propagar o request_id para o gateway é o que permite
-                // achar os dois lados da chamada com o mesmo id.
+                // FASE 1: o id sai do Context, não de request(). Duas razões:
+                // o Context tem o valor já VALIDADO pelo middleware, e o retry
+                // desta chamada na Fase 2 pode acontecer dentro de um job,
+                // onde request() não existe.
                 // FASE 4: aqui também entra o header `traceparent` (W3C).
-                'X-Request-Id' => (string) request()->header('X-Request-Id', '-'),
+                'X-Request-Id' => (string) Context::get('request_id', '-'),
             ])
             ->post($url, [
                 'order_id' => $order->id,

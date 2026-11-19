@@ -3,83 +3,76 @@
 namespace App\Logging;
 
 use Illuminate\Log\Logger;
+use Monolog\Handler\FormattableHandlerInterface;
+use Monolog\LogRecord;
 
 /**
- * FASE 1 — ESQUELETO, e OPCIONAL. Faça o passo 1 antes (a env
- * LOG_STDERR_FORMATTER) e olhe a saída: se ela já te servir, não precisa disto.
+ * FASE 1, passo 2 — o "tap" do canal `stderr`.
  *
- * Um "tap" recebe o Logger depois de o canal ser criado, e deixa você mexer no
- * Monolog por baixo: trocar o formatter, empilhar processors. É o jeito nativo
- * do Laravel de customizar um canal sem reescrever o driver.
+ * Um tap recebe o Logger depois de o canal ser criado e deixa mexer no Monolog
+ * por baixo: trocar o formatter, empilhar processors. É o jeito nativo do
+ * Laravel de customizar um canal sem escrever um driver.
  *
- * Ligue descomentando o `tap` no canal `stderr` em config/logging.php.
- *
- * ---------------------------------------------------------------------------
- * POR QUE VOCÊ PODE QUERER ISTO
- *
- * Com o JsonFormatter puro, a saída fica assim:
- *
- *     {"message":"order.created","context":{"amount_cents":1990},
- *      "level":200,"level_name":"INFO","channel":"local",
- *      "datetime":"2026-11-18T03:27:52.123456+00:00",
- *      "extra":{"request_id":"01JC..."}}
- *
- * Note duas coisas:
- *   - `request_id` está dentro de `extra` (é onde o ContextLogProcessor põe)
- *   - o que você passou no `Log::info('...', [...])` está dentro de `context`
- *
- * Isso FUNCIONA — Loki indexa aninhado. Mas se você quiser consultar por
- * `request_id` sem prefixo, ou achatar `context`/`extra` na raiz, é aqui.
+ * Ligado em `config/logging.php`, no canal `stderr`. Comente a linha do `tap`
+ * ali e o log volta para o `JsonFormatter` puro da env `LOG_STDERR_FORMATTER`
+ * (o passo 1), que também é JSON, só com outra forma.
  *
  * ---------------------------------------------------------------------------
- * O QUE IMPLEMENTAR
+ * O QUE ELE FAZ
  *
- * 1. Trocar o formatter em cada handler do canal:
+ * 1. Empilha um processor com o que é fixo do PROCESSO: `source` e `host`.
+ *    Isso responde a primeira pergunta de qualquer investigação séria: "quem
+ *    escreveu esta linha, o web ou o worker?". Os dois containers rodam a
+ *    MESMA imagem e o MESMO código, então o papel do processo não está no
+ *    código — vem de quem o subiu (`LOG_SOURCE` no docker-compose, exposto
+ *    como `logging.source`).
  *
- *        foreach ($logger->getHandlers() as $handler) {
- *            $handler->setFormatter(new JsonFormatter(
- *                batchMode: JsonFormatter::BATCH_MODE_NEWLINES,
- *                appendNewline: true,
- *                ignoreEmptyContextAndExtra: true,   // menos ruído
- *            ));
- *        }
+ * 2. Troca o formatter de cada handler por `App\Logging\LogLineFormatter`,
+ *    que é quem define a forma da linha.
  *
- *    Ou escrever um formatter próprio: estenda
- *    `Monolog\Formatter\NormalizerFormatter` e implemente `format(LogRecord)`
- *    devolvendo a string JSON na forma que você quiser.
+ * ---------------------------------------------------------------------------
+ * DUAS COISAS QUE NÃO SÃO ÓBVIAS
  *
- * 2. Empilhar um processor com o que é fixo do processo. Isto responde uma
- *    pergunta que você VAI ter na primeira investigação séria: "quem escreveu
- *    esta linha, o web ou o worker?"
+ * **Ordem dos processors.** O `LogManager` empurra o `ContextLogProcessor`
+ * DEPOIS de rodar este tap (LogManager.php:150), e `pushProcessor` do Monolog
+ * é uma PILHA: o último empurrado roda primeiro. Então, quando o processor
+ * daqui executa, o Context já foi aplicado e `$record->extra` já contém
+ * `request_id`. É isso que torna possível o formatter achatar `extra` na raiz.
  *
- *        $logger->pushProcessor(function (LogRecord $record) {
- *            return $record->with(extra: [
- *                ...$record->extra,
- *                'service' => ...,   // 'app' ou 'worker'
- *                'host'    => gethostname(),
- *            ]);
- *        });
- *
- *    De onde vem o 'service'? O container `app` roda php-fpm e o `worker`
- *    roda `queue:work` — a MESMA imagem, o mesmo código. Decida como
- *    diferenciar (`php_sapi_name()`? `App::runningInConsole()`? uma env no
- *    compose?) e por quê.
- *
- * 3. FASE 4 vai somar `trace_id` e `span_id` aqui. É o que permite pular do
- *    log para o trace no Grafana. Deixe espaço para isso.
+ * **`source` e `host` são resolvidos uma vez**, na criação do canal, e não a
+ * cada linha: são constantes do processo. `gethostname()` dentro do container
+ * devolve o id do container, que é como você distingue duas réplicas do worker
+ * quando houver mais de uma.
  *
  * ---------------------------------------------------------------------------
  * CUIDADO
  *
- * Log é dado que sai do processo e fica armazenado. Não coloque aqui o que
- * você não quer num índice de busca: e-mail de cliente, token, cartão. Para
- * dado que precisa atravessar para o job mas NÃO deve ir ao log, existe
+ * Log é dado que sai do processo e fica armazenado. Não ponha aqui o que você
+ * não quer num índice de busca: e-mail de cliente, token, cartão. Para dado
+ * que precisa atravessar para o job mas NÃO deve ir ao log existe
  * `Context::addHidden()`.
+ *
+ * FASE 4 vai somar `trace_id` e `span_id`. Eles não entram aqui: entram no
+ * Context (ou num processor do pacote do OpenTelemetry) e o formatter já os
+ * leva para a raiz da linha sem mudança nenhuma.
  */
 class FormatLogsAsJson
 {
     public function __invoke(Logger $logger): void
     {
-        // TODO: 1 e 2 acima.
+        $source = (string) config('logging.source', 'app');
+        $host = gethostname() ?: 'unknown';
+
+        $logger->pushProcessor(fn (LogRecord $record): LogRecord => $record->with(extra: [
+            ...$record->extra,
+            'source' => $source,
+            'host' => $host,
+        ]));
+
+        foreach ($logger->getHandlers() as $handler) {
+            if ($handler instanceof FormattableHandlerInterface) {
+                $handler->setFormatter(new LogLineFormatter());
+            }
+        }
     }
 }

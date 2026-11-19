@@ -38,6 +38,31 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Origem da linha de log (FASE 1)
+    |--------------------------------------------------------------------------
+    |
+    | `app` e `worker` rodam a MESMA imagem e o MESMO código, então a linha de
+    | log não diz, por si, quem a escreveu. O docker-compose define LOG_SOURCE
+    | por container (`app` no anchor, `worker` no override) e isto expõe o
+    | valor como config, para o tap App\Logging\FormatLogsAsJson poder marcar
+    | cada linha.
+    |
+    | O campo se chama `source` de propósito: é o nome que o log de acesso do
+    | nginx ("source":"nginx") e o do gateway fake ("source":"gateway") já
+    | usam. Com os quatro iguais, uma consulta por `source` no Loki vale para
+    | os quatro processos, sem tradução.
+    |
+    | Por que uma env e não php_sapi_name(): o SAPI distingue fpm-fcgi de cli,
+    | mas um `artisan` rodado dentro do container `app` também é cli e não é
+    | worker. Quem sabe o papel do processo é quem o subiu, ou seja o compose.
+    | A Fase 4 vai querer a mesma informação como OTEL_SERVICE_NAME.
+    |
+    */
+
+    'source' => env('LOG_SOURCE', 'app'),
+
+    /*
+    |--------------------------------------------------------------------------
     | Log Channels
     |--------------------------------------------------------------------------
     |
@@ -107,18 +132,25 @@ return [
         | FASE 1 — este é o canal que o projeto usa (LOG_CHANNEL=stderr).
         |----------------------------------------------------------------------
         |
-        | PASSO 1 do log em JSON é uma variável de ambiente, não código. Em
-        | src/.env:
+        | PASSO 1, FEITO: o log em JSON é uma variável de ambiente, não código.
+        | Em src/.env:
         |
         |     LOG_STDERR_FORMATTER=Monolog\Formatter\JsonFormatter
         |
-        | Isso já te dá uma linha por evento, com message, level, channel,
-        | datetime, context e extra. O `request_id` do Context cai em `extra`.
+        | Isso dá uma linha JSON por evento, com message, level, channel,
+        | datetime, context e extra. Repare na divisão: o que você passa em
+        | Log::info('evento', [...]) cai em `context`, e o que a facade Context
+        | publica cai em `extra`.
         |
-        | PASSO 2 (opcional) é moldar esse JSON: descomente o `tap` abaixo e
-        | implemente App\Logging\FormatLogsAsJson. Faça o passo 1 primeiro e
-        | olhe a saída: talvez ela já te sirva, e aí o passo 2 não é
-        | necessário.
+        | PASSO 2, FEITO: o `tap` abaixo entrega o canal para
+        | App\Logging\FormatLogsAsJson, que marca cada linha com `source` e
+        | `host` e troca o formatter por App\Logging\LogLineFormatter. A linha
+        | fica na mesma forma que a do nginx e a do gateway fake (`ts`,
+        | `source`, `event`, `request_id` na RAIZ), e aí uma consulta só vale
+        | para os quatro processos.
+        |
+        | O tap GANHA da env acima, porque roda depois dela: a env é o
+        | fallback de quem comentar a linha do `tap`.
         */
         'stderr' => [
             'driver' => 'monolog',
@@ -127,9 +159,25 @@ return [
             'handler_with' => [
                 'stream' => 'php://stderr',
             ],
-            'formatter' => env('LOG_STDERR_FORMATTER'),
+            // `?: null` e não só env(): com `LOG_STDERR_FORMATTER=` (vazio), o
+            // env() devolve string VAZIA, e o LogManager decide por
+            // isset($config['formatter']) — isset('') é TRUE. Ele cai em
+            // app->make(''), que lança BindingResolutionException; o
+            // LogManager captura a exceção e troca o canal pelo EMERGENCY
+            // LOGGER, que escreve em storage/logs/laravel.log DENTRO do
+            // container. Resultado: zero linha no `docker compose logs`, e
+            // nada no output dizendo por quê. Com null, isset() é false e vale
+            // o LineFormatter padrão.
+            'formatter' => env('LOG_STDERR_FORMATTER') ?: null,
+            // Argumentos de construtor do formatter, sem precisar de código.
+            // ignoreEmptyContextAndExtra tira os "context":{} e "extra":{}
+            // vazios, que são a maior parte do ruído das linhas do framework.
+            // Ignorado quando 'formatter' é null.
+            'formatter_with' => [
+                'ignoreEmptyContextAndExtra' => true,
+            ],
             'processors' => [PsrLogMessageProcessor::class],
-            // 'tap' => [App\Logging\FormatLogsAsJson::class],
+            'tap' => [App\Logging\FormatLogsAsJson::class],
         ],
 
         'syslog' => [

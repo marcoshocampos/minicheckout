@@ -6,6 +6,7 @@ use App\Enums\OrderStatus;
 use App\Models\Order;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Context;
 use Illuminate\Support\Facades\Log;
 
 /**
@@ -51,10 +52,18 @@ class PaymentWebhookController extends Controller
             'occurred_at' => ['nullable', 'date'],
         ]);
 
+        // FASE 1: o que identifica este evento vale para TODAS as linhas daqui
+        // para frente, inclusive as que o handler de exceção escrever.
+        //
+        // O `request_id` desta requisição é o da requisição que criou o
+        // pedido: o gateway devolve o id que recebeu, e tanto o nginx quanto o
+        // middleware respeitam o header que chega. Ver a nota sobre id de
+        // fluxo em App\Http\Middleware\RequestId.
+        Context::add('order_id', $data['order_id']);
+        Context::add('event_id', $data['event_id']);
+
         Log::info('webhook.received', [
-            'event_id' => $data['event_id'],
             'type' => $data['type'],
-            'order_id' => $data['order_id'],
             // O gateway manda 1/3, 2/3, 3/3 quando duplica: é como você vê a
             // entrega repetida no log sem adivinhar.
             'delivery' => $request->header('X-Gateway-Delivery'),
@@ -63,7 +72,7 @@ class PaymentWebhookController extends Controller
         $order = Order::find($data['order_id']);
 
         if ($order === null) {
-            Log::warning('webhook.order_not_found', ['order_id' => $data['order_id']]);
+            Log::warning('webhook.order_not_found');
 
             return response()->json(['status' => 'ignored'], 202);
         }
@@ -84,8 +93,6 @@ class PaymentWebhookController extends Controller
         }
 
         Log::info('webhook.processed', [
-            'event_id' => $data['event_id'],
-            'order_id' => $order->id,
             'new_status' => $order->status->value,
         ]);
 

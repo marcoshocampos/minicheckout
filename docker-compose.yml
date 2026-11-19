@@ -25,9 +25,14 @@ x-app-env: &app-env
   CACHE_STORE: redis
   SESSION_DRIVER: redis
   # stderr => os logs saem no `docker compose logs`, não num arquivo dentro do container.
-  # Fase 1 troca o formatter deste canal para JSON.
+  # O formato é JSON desde a Fase 1, pela env LOG_STDERR_FORMATTER em src/.env.
   LOG_CHANNEL: stderr
   LOG_LEVEL: debug
+  # Quem escreveu a linha de log: `app` e `worker` rodam a MESMA imagem e o
+  # MESMO código, então o papel do processo só pode vir de quem o subiu. O
+  # serviço `worker` sobrescreve para `worker`. Ver config/logging.php
+  # ('source') e o tap App\Logging\FormatLogsAsJson.
+  LOG_SOURCE: app
   GATEWAY_URL: http://gateway:8080
 
 x-app: &app
@@ -84,7 +89,10 @@ services:
   worker:
     <<: *app
     restart: unless-stopped
-    environment: *app-env
+    environment:
+      # merge do anchor + a única diferença deste container: quem ele é no log.
+      <<: *app-env
+      LOG_SOURCE: worker
     # Fase 2 vai mexer em tries/backoff; aqui ainda é o default cru, de propósito.
     command: ["php", "artisan", "queue:work", "--verbose", "--tries=1"]
     depends_on:

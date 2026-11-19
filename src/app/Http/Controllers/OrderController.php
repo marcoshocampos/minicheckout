@@ -8,6 +8,7 @@ use App\Jobs\SendOrderNotification;
 use App\Models\Order;
 use App\Services\PaymentGateway;
 use Illuminate\Http\JsonResponse;
+use Illuminate\Support\Facades\Context;
 use Illuminate\Support\Facades\Log;
 use RuntimeException;
 
@@ -29,12 +30,12 @@ class OrderController extends Controller
             'customer_email' => $data['customer_email'],
         ]);
 
-        // FASE 1: este array vira contexto automático.
-        // Hoje você repete order_id em todo log na mão; com a facade Context,
-        // request_id e order_id entram sozinhos em todos os logs da requisição
-        // E nos logs do job que ela dispara.
+        // FASE 1: uma linha, e `order_id` passa a sair em TODO log desta
+        // requisição — e nos logs do job que ela dispara. Nenhum Log::info()
+        // daqui para baixo repete o id.
+        Context::add('order_id', $order->id);
+
         Log::info('order.created', [
-            'order_id' => $order->id,
             'amount_cents' => $order->amount_cents,
             'idempotency_key' => $idempotencyKey,
         ]);
@@ -54,7 +55,6 @@ class OrderController extends Controller
             ]);
 
             Log::info('order.declined', [
-                'order_id' => $order->id,
                 'decline_code' => $response->json('decline_code'),
             ]);
 
@@ -73,11 +73,12 @@ class OrderController extends Controller
             ]);
 
             Log::info('order.paid', [
-                'order_id' => $order->id,
                 'payment_id' => $order->payment_id,
             ]);
 
-            // FASE 1: o trace_id/request_id tem que atravessar esta fronteira.
+            // FASE 1: nada é passado para o job, e ainda assim ele loga com o
+            // mesmo request_id e order_id. O Context é serializado no payload
+            // do job e re-hidratado no worker, pelo framework.
             // FASE 3: rodar este job duas vezes não pode notificar duas vezes.
             SendOrderNotification::dispatch($order);
 
@@ -88,7 +89,6 @@ class OrderController extends Controller
         $order->update(['status' => OrderStatus::Failed]);
 
         Log::error('order.payment_failed', [
-            'order_id' => $order->id,
             'gateway_status' => $response->status(),
             'gateway_body' => $response->json(),
         ]);

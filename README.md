@@ -16,6 +16,7 @@ Tudo neste projeto é documentado. Em três lugares, com papéis diferentes:
 Documentos de fase:
 
 - [Fase 0 — Setup](docs/fase-0-setup.md)
+- [Fase 1 — Logs estruturados e correlação](docs/fase-1-logs-e-correlacao.md)
 
 ### As APIs (Swagger)
 
@@ -135,8 +136,44 @@ docker compose exec db psql -U minicheckout -d minicheckout -c 'table orders'
 docker compose logs --tail=30 worker
 ```
 
-Grafana abre em http://localhost:3010 (se pedir login, `admin` / `admin`). Na
-Fase 0 ele está vazio de propósito: nada está instrumentado ainda.
+Grafana abre em http://localhost:3010 (se pedir login, `admin` / `admin`). Ele
+está vazio de propósito até a Fase 4: o log da Fase 1 sai no
+`docker compose logs`, e mandá-lo para o Loki vem junto com o tracing.
+
+## O teste observável da Fase 1
+
+```bash
+# o worker é processo longo: não recarrega código sozinho
+docker compose restart worker
+
+curl -i -XPOST http://localhost:8010/orders \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: pedido-de-teste-da-fase-1' \
+  -H 'X-Request-Id: req-fase1-depois' \
+  -d '{"amount_cents": 1990, "currency": "BRL", "customer_email": "fase1@example.test"}'
+```
+
+O response volta com `X-Request-Id: req-fase1-depois`. Agora ache tudo que
+aquela requisição escreveu, nos quatro processos:
+
+```bash
+./scripts/follow-request.sh req-fase1-depois
+```
+
+Tem que dar **11 linhas**: 2 do nginx, 4 do app, 2 do **worker** e 3 do
+gateway. As do worker são o ponto da fase — outro processo, outro container, e
+ninguém passou o id para o job.
+
+> Use uma `Idempotency-Key` que **não** contenha o `request_id`: o script faz
+> `grep` na linha inteira e a chave daria falso positivo.
+
+```bash
+# contrato do middleware e forma da linha de log
+docker compose exec app php vendor/bin/phpunit
+```
+
+O como e o porquê estão em
+[docs/fase-1-logs-e-correlacao.md](docs/fase-1-logs-e-correlacao.md).
 
 ## Ligando o caos
 
